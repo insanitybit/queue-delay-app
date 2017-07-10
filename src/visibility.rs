@@ -13,23 +13,27 @@ use arrayvec::ArrayVec;
 use std::iter::Iterator;
 use std::thread;
 use delete::*;
+use lru_time_cache::LruCache;
 
-// The visibility timeout manager creates and registers VisibilityTimeouts
-// It is also responsible for deregistering VisibilityTimeouts
+/// The MessageStateManager manages the local message's state in the SQS service. That is, it will
+/// handle maintaining the messages visibility, and it will handle deleting the message
+/// Anything actors that may impact this state should likely be invoked or managed by this actor
 #[derive(Clone)]
-pub struct VisibilityTimeoutManager
+pub struct MessageStateManager
 {
-    timers: HashMap<String, VisibilityTimeoutActor>,
+    timers: LruCache<String, VisibilityTimeoutActor>,
     buffer: VisibilityTimeoutExtenderBufferActor,
     deleter: MessageDeleteBufferActor
 }
 
-impl VisibilityTimeoutManager
+impl MessageStateManager
 {
-    pub fn new(buffer: VisibilityTimeoutExtenderBufferActor, deleter: MessageDeleteBufferActor) -> VisibilityTimeoutManager
+    pub fn new(buffer: VisibilityTimeoutExtenderBufferActor, deleter: MessageDeleteBufferActor) -> MessageStateManager
     {
-        VisibilityTimeoutManager {
-            timers: HashMap::with_capacity(100),
+        // Create the new MessageStateManager with a maximum cache  lifetime of 12 hours, which is
+        // the maximum amount of time a message can be kept invisible
+        MessageStateManager {
+            timers: LruCache::with_expiry_duration(Duration::from_secs(12 * 60 * 60)),
             buffer,
             deleter
         }
@@ -51,7 +55,6 @@ impl VisibilityTimeoutManager
             None => {
                 println!("Attempting to deregister timeout that does not exist:\
                 receipt: {} should_delete: {}", receipt, should_delete);
-                return;
             }
         };
     }
@@ -74,7 +77,7 @@ pub struct VisibilityTimeoutManagerActor {
 }
 
 impl VisibilityTimeoutManagerActor {
-    pub fn new(actor: VisibilityTimeoutManager)
+    pub fn new(actor: MessageStateManager)
                -> VisibilityTimeoutManagerActor
     {
         let mut actor = actor;
@@ -129,7 +132,7 @@ impl VisibilityTimeoutManagerActor {
     }
 }
 
-impl VisibilityTimeoutManager
+impl MessageStateManager
 {
     pub fn route_msg(&mut self, msg: VisibilityTimeoutManagerMessage) {
         match msg {
@@ -157,7 +160,9 @@ pub struct VisibilityTimeout
 
 impl VisibilityTimeout
 {
-    pub fn new(buf: VisibilityTimeoutExtenderBufferActor, deleter: MessageDeleteBufferActor, receipt: String) -> VisibilityTimeout {
+    pub fn new(buf: VisibilityTimeoutExtenderBufferActor,
+               deleter: MessageDeleteBufferActor,
+               receipt: String) -> VisibilityTimeout {
         VisibilityTimeout {
             buf,
             receipt,
@@ -208,7 +213,7 @@ impl VisibilityTimeoutActor {
                     Ok(msg) => {
                         match msg {
                             VisibilityTimeoutMessage::StartVariant { init_timeout, start_time } => {
-                                actor.buf.extend(receipt.clone(), init_timeout, start_time.clone(), false, start_time.clone());
+                                actor.buf.extend(receipt.clone(), init_timeout, start_time.clone(), false);
 
                                 // we can't afford to not flush the initial timeout
                                 actor.buf.flush();
@@ -220,7 +225,7 @@ impl VisibilityTimeoutActor {
                             => {
                                 match _start_time {
                                     Some(st) => {
-                                        actor.buf.extend(receipt.clone(), dur, st.clone(), should_delete, st.clone());
+                                        actor.buf.extend(receipt.clone(), dur, st.clone(), should_delete);
                                     }
                                     None => {
                                         println!("Error, no start time provided")
@@ -234,7 +239,7 @@ impl VisibilityTimeoutActor {
                         dur = dur * 2;
                         match _start_time {
                             Some(st) => {
-                                actor.buf.extend(receipt.clone(), dur, st.clone(), false, st.clone());
+                                actor.buf.extend(receipt.clone(), dur, st.clone(), false);
                             }
                             None => {
                                 println!("Error, no start time provided")
@@ -301,7 +306,7 @@ impl VisibilityTimeoutExtenderBroker
         }
     }
 
-    pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool, Instant)>) {
+    pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         self.sender.send(
             VisibilityTimeoutExtenderMessage::ExtendVariant {
                 timeout_info
@@ -318,7 +323,7 @@ pub struct VisibilityTimeoutExtenderBuffer
 {
     extender_broker: VisibilityTimeoutExtenderBroker,
     // Replace this with a Broker to do proper work stealing
-    buffer: ArrayVec<[(String, Duration, Instant, bool, Instant); 10]>,
+    buffer: ArrayVec<[(String, Duration, Instant, bool); 10]>,
     last_flush: Instant,
     flush_period: Duration
 }
@@ -340,11 +345,11 @@ impl VisibilityTimeoutExtenderBuffer
     }
 
 
-    pub fn extend(&mut self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool, init_time: Instant) {
+    pub fn extend(&mut self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool) {
         if self.buffer.is_full() {
             self.flush();
         }
-        self.buffer.push((receipt, timeout, start_time, should_delete, init_time));
+        self.buffer.push((receipt, timeout, start_time, should_delete));
 
         //        if should_delete {
         //            self.flush()
@@ -373,7 +378,7 @@ impl VisibilityTimeoutExtenderBuffer
         }
         let mut index = Some(0);
 
-        for (i, &(ref r, _, _, _, _)) in self.buffer.iter().enumerate() {
+        for (i, &(ref r, _, _, _)) in self.buffer.iter().enumerate() {
             if *r == receipt {
                 index = Some(i);
                 break
@@ -403,7 +408,7 @@ impl VisibilityTimeoutExtenderBuffer
 }
 
 pub enum VisibilityTimeoutExtenderBufferMessage {
-    Extend { receipt: String, timeout: Duration, start_time: Instant, should_delete: bool, init_time: Instant },
+    Extend { receipt: String, timeout: Duration, start_time: Instant, should_delete: bool },
     Flush {},
     DropMessage { receipt: String },
     OnTimeout {},
@@ -454,13 +459,12 @@ impl VisibilityTimeoutExtenderBufferActor {
         }
     }
 
-    pub fn extend(&self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool, init_time: Instant) {
+    pub fn extend(&self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool) {
         let msg = VisibilityTimeoutExtenderBufferMessage::Extend {
             receipt,
             timeout,
             should_delete,
             start_time,
-            init_time
         };
         self.sender.send(msg).expect("All receivers have died.");
     }
@@ -490,9 +494,8 @@ impl VisibilityTimeoutExtenderBuffer
                 timeout,
                 start_time,
                 should_delete,
-                init_time
             } => {
-                self.extend(receipt, timeout, start_time, should_delete, init_time)
+                self.extend(receipt, timeout, start_time, should_delete)
             }
             VisibilityTimeoutExtenderBufferMessage::Flush {} => self.flush(),
             VisibilityTimeoutExtenderBufferMessage::DropMessage { receipt } => self.drop_message(receipt),
@@ -612,11 +615,11 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
         }
     }
 
-    pub fn extend(&mut self, timeout_info: Vec<(String, Duration, Instant, bool, Instant)>) {
+    pub fn extend(&mut self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         let mut id_map = HashMap::with_capacity(10);
 
         let mut to_delete = vec![];
-        let entries: Vec<_> = timeout_info.into_iter().filter_map(|(receipt, timeout, start_time, should_delete, _)| {
+        let entries: Vec<_> = timeout_info.into_iter().filter_map(|(receipt, timeout, start_time, should_delete)| {
             let now = Instant::now();
             if start_time + timeout < now {
                 println!("ERROR: MESSAGE TIMEOUT HAS EXPIRED ALREADY: {:#?} {:#?} {:#?}", start_time, timeout, now);
@@ -687,7 +690,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
 
 pub enum VisibilityTimeoutExtenderMessage {
     ExtendVariant {
-        timeout_info: Vec<(String, Duration, Instant, bool, Instant)>,
+        timeout_info: Vec<(String, Duration, Instant, bool)>,
     },
 }
 
@@ -775,7 +778,7 @@ impl VisibilityTimeoutExtenderActor {
         }
     }
 
-    pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool, Instant)>) {
+    pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         let msg = VisibilityTimeoutExtenderMessage::ExtendVariant { timeout_info };
         self.sender.send(msg).expect("All receivers have died.");
     }
@@ -966,7 +969,7 @@ mod test {
         let flusher = BufferFlushTimer::new(buffer.clone(), Duration::from_secs(1));
         BufferFlushTimerActor::new(flusher);
 
-        let timeout_manager = VisibilityTimeoutManager::new(Timer::default(), buffer);
+        let timeout_manager = MessageStateManager::new(Timer::default(), buffer);
         let timeout_manager = VisibilityTimeoutManagerActor::new(timeout_manager);
 
         for i in 0..500 {

@@ -65,19 +65,6 @@ macro_rules! time {
         }
     );
 }
-//
-//macro_rules! call (
-//  ($fun:ident, $i:expr) => ( $fun!( $i ) );
-//  ($fun:ident, $i:expr, $($args:expr),* ) => ( $fun!( $i, $($args),* ) );
-//);
-//
-//macro_rules! try_or_log {
-//    ($ex:expr, $msg:expr, $log:ident)    => {
-//        if let Err(e) = $ex {
-//            call!($log, "{} {}", $msg, e.description());
-//        }
-//    }
-//}
 
 macro_rules! timeout_ms {
     ($pool:expr, $closure:expr, $dur:expr) => {
@@ -126,7 +113,7 @@ use delete::*;
 use publish::*;
 use std::time::Duration;
 
-const PROCESSOR_COUNT: usize = 100;
+const PROCESSOR_COUNT: usize = 10;
 const CONSUMER_COUNT: usize = 10;
 
 fn main() {
@@ -201,7 +188,7 @@ fn main() {
     let flusher = BufferFlushTimer::new(buffer.clone(), Duration::from_millis(200));
     std::mem::forget(BufferFlushTimerActor::new(flusher));
 
-    let timeout_manager = VisibilityTimeoutManager::new(buffer, deleter.clone());
+    let timeout_manager = MessageStateManager::new(buffer, deleter.clone());
     let timeout_manager = VisibilityTimeoutManagerActor::new(timeout_manager);
 
     let publisher = MessagePublisherBroker::new(
