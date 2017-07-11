@@ -15,13 +15,13 @@ pub struct MessagePublisher<SN>
     where SN: Sns + Send + Sync + 'static,
 {
     sns_client: Arc<SN>,
-    vis_manager: VisibilityTimeoutManagerActor,
+    vis_manager: MessageStateManagerActor,
 }
 
 impl<SN> MessagePublisher<SN>
     where SN: Sns + Send + Sync + 'static,
 {
-    pub fn new(sns_client: Arc<SN>,  vis_manager: VisibilityTimeoutManagerActor) -> MessagePublisher<SN> {
+    pub fn new(sns_client: Arc<SN>, vis_manager: MessageStateManagerActor) -> MessagePublisher<SN> {
         MessagePublisher {
             sns_client,
             vis_manager

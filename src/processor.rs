@@ -15,7 +15,7 @@ use std::thread;
 pub struct DelayMessageProcessor<SN>
     where SN: Sns + Send + Sync + 'static,
 {
-    vis_manager: VisibilityTimeoutManagerActor,
+    vis_manager: MessageStateManagerActor,
     publisher: MessagePublisherBroker,
     topic_creator: TopicCreator<SN>
 }
@@ -23,7 +23,7 @@ pub struct DelayMessageProcessor<SN>
 impl<SN> DelayMessageProcessor<SN>
     where SN: Sns + Send + Sync + 'static,
 {
-    pub fn new(vis_manager: VisibilityTimeoutManagerActor,
+    pub fn new(vis_manager: MessageStateManagerActor,
                publisher: MessagePublisherBroker,
                topic_creator: TopicCreator<SN>)
                -> DelayMessageProcessor<SN>

@@ -60,7 +60,7 @@ impl MessageStateManager
     }
 }
 
-pub enum VisibilityTimeoutManagerMessage {
+pub enum MessageStateManagerMessage {
     RegisterVariant {
         receipt: String,
         visibility_timeout: Duration,
@@ -70,15 +70,15 @@ pub enum VisibilityTimeoutManagerMessage {
 }
 
 #[derive(Clone)]
-pub struct VisibilityTimeoutManagerActor {
-    pub sender: Sender<VisibilityTimeoutManagerMessage>,
-    receiver: Receiver<VisibilityTimeoutManagerMessage>,
+pub struct MessageStateManagerActor {
+    pub sender: Sender<MessageStateManagerMessage>,
+    receiver: Receiver<MessageStateManagerMessage>,
     id: String,
 }
 
-impl VisibilityTimeoutManagerActor {
+impl MessageStateManagerActor {
     pub fn new(actor: MessageStateManager)
-               -> VisibilityTimeoutManagerActor
+               -> MessageStateManagerActor
     {
         let mut actor = actor;
         let (sender, receiver) = unbounded();
@@ -106,7 +106,7 @@ impl VisibilityTimeoutManagerActor {
                 }
             });
 
-        VisibilityTimeoutManagerActor {
+        MessageStateManagerActor {
             sender: sender,
             receiver: receiver,
             id: id,
@@ -114,7 +114,7 @@ impl VisibilityTimeoutManagerActor {
     }
 
     pub fn register(&self, receipt: String, visibility_timeout: Duration, start_time: Instant) {
-        let msg = VisibilityTimeoutManagerMessage::RegisterVariant {
+        let msg = MessageStateManagerMessage::RegisterVariant {
             receipt,
             visibility_timeout,
             start_time
@@ -127,20 +127,20 @@ impl VisibilityTimeoutManagerActor {
             println!("Error when processing message, apparently!");
         }
 
-        let msg = VisibilityTimeoutManagerMessage::DeregisterVariant { receipt, should_delete };
+        let msg = MessageStateManagerMessage::DeregisterVariant { receipt, should_delete };
         self.sender.send(msg).expect("All receivers have died.");
     }
 }
 
 impl MessageStateManager
 {
-    pub fn route_msg(&mut self, msg: VisibilityTimeoutManagerMessage) {
+    pub fn route_msg(&mut self, msg: MessageStateManagerMessage) {
         match msg {
-            VisibilityTimeoutManagerMessage::RegisterVariant {
+            MessageStateManagerMessage::RegisterVariant {
                 receipt, visibility_timeout, start_time
             } =>
                 self.register(receipt, visibility_timeout, start_time),
-            VisibilityTimeoutManagerMessage::DeregisterVariant { receipt, should_delete } => {
+            MessageStateManagerMessage::DeregisterVariant { receipt, should_delete } => {
                 self.deregister(receipt, should_delete)
             }
         };
@@ -970,7 +970,7 @@ mod test {
         BufferFlushTimerActor::new(flusher);
 
         let timeout_manager = MessageStateManager::new(Timer::default(), buffer);
-        let timeout_manager = VisibilityTimeoutManagerActor::new(timeout_manager);
+        let timeout_manager = MessageStateManagerActor::new(timeout_manager);
 
         for i in 0..500 {
             timeout_manager.register(format!("receipt{}", i), Duration::from_secs(30));

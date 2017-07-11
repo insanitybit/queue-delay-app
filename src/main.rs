@@ -189,7 +189,7 @@ fn main() {
     std::mem::forget(BufferFlushTimerActor::new(flusher));
 
     let timeout_manager = MessageStateManager::new(buffer, deleter.clone());
-    let timeout_manager = VisibilityTimeoutManagerActor::new(timeout_manager);
+    let timeout_manager = MessageStateManagerActor::new(timeout_manager);
 
     let publisher = MessagePublisherBroker::new(
         |actor| {

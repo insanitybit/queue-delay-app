@@ -20,7 +20,7 @@ pub struct DelayMessageConsumer<SQ>
     queue_url: String,
     metrics: Arc<Client>,
     actor: DelayMessageConsumerActor,
-    vis_manager: VisibilityTimeoutManagerActor,
+    vis_manager: MessageStateManagerActor,
     processor: DelayMessageProcessorBroker
 }
 
@@ -31,7 +31,7 @@ impl<SQ> DelayMessageConsumer<SQ>
                queue_url: String,
                metrics: Arc<Client>,
                actor: DelayMessageConsumerActor,
-               vis_manager: VisibilityTimeoutManagerActor,
+               vis_manager: MessageStateManagerActor,
                processor: DelayMessageProcessorBroker)
                -> DelayMessageConsumer<SQ>
     {
