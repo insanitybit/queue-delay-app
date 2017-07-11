@@ -181,6 +181,12 @@ impl MessageDeleterActor {
 
         actor
     }
+    
+    pub fn delete_messages(&self, receipts: Vec<(String, Instant)>) {
+        self.sender.send(
+            MessageDeleterMessage::DeleteMessages { receipts }
+        ).unwrap();
+    }
 }
 
 #[derive(Clone)]
