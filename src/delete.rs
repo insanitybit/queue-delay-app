@@ -23,6 +23,7 @@ pub struct MessageDeleter<SQ>
 impl<SQ> MessageDeleter<SQ>
     where SQ: Sqs + Send + Sync + 'static,
 {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new(sqs_client: Arc<SQ>, queue_url: String) -> MessageDeleter<SQ> {
         MessageDeleter {
             sqs_client,
@@ -30,6 +31,7 @@ impl<SQ> MessageDeleter<SQ>
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn delete_messages(&self, receipts: Vec<(String, Instant)>) {
         let msg_count = receipts.len();
         println!("Deleting {} messages", msg_count);
@@ -82,6 +84,7 @@ impl<SQ> MessageDeleter<SQ>
 
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn route_msg(&self, msg: MessageDeleterMessage) {
         match msg {
             MessageDeleterMessage::DeleteMessages { receipts } => self.delete_messages(receipts)
@@ -103,6 +106,7 @@ pub struct MessageDeleterActor {
 }
 
 impl MessageDeleterActor {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new<SQ>(actor: MessageDeleter<SQ>) -> MessageDeleterActor
         where SQ: Sqs + Send + Sync + 'static,
     {
@@ -138,6 +142,7 @@ impl MessageDeleterActor {
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn from_queue<SQ, F>(
         new: &F,
         sender: Sender<MessageDeleterMessage>,
@@ -181,6 +186,13 @@ impl MessageDeleterActor {
 
         actor
     }
+
+    #[cfg_attr(feature="flame_it", flame)]
+    pub fn delete_messages(&self, receipts: Vec<(String, Instant)>) {
+        self.sender.send(
+            MessageDeleterMessage::DeleteMessages { receipts }
+        ).unwrap();
+    }
 }
 
 #[derive(Clone)]
@@ -193,6 +205,7 @@ pub struct MessageDeleterBroker
 
 impl MessageDeleterBroker
 {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new<T, F, SQ>(new: F,
                          worker_count: usize,
                          max_queue_depth: T)
@@ -216,6 +229,7 @@ impl MessageDeleterBroker
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn delete_messages(&self, receipts: Vec<(String, Instant)>) {
         self.sender.send(
             MessageDeleterMessage::DeleteMessages { receipts }
@@ -230,15 +244,17 @@ pub struct MessageDeleteBuffer {
 }
 
 impl MessageDeleteBuffer {
-    pub fn new(deleter_broker: MessageDeleterBroker, flush_period: u8) -> MessageDeleteBuffer
+    #[cfg_attr(feature="flame_it", flame)]
+    pub fn new(deleter_broker: MessageDeleterBroker, flush_period: Duration) -> MessageDeleteBuffer
     {
         MessageDeleteBuffer {
             deleter_broker: deleter_broker,
             buffer: ArrayVec::new(),
-            flush_period: Duration::from_secs(flush_period as u64)
+            flush_period
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn delete_message(&mut self, receipt: String, init_time: Instant) {
         if self.buffer.is_full() {
             println!("MessageDeleteBuffer buffer full. Flushing.");
@@ -248,11 +264,13 @@ impl MessageDeleteBuffer {
         self.buffer.push((receipt, init_time));
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn flush(&mut self) {
         self.deleter_broker.delete_messages(Vec::from(self.buffer.as_ref()));
         self.buffer.clear();
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn on_timeout(&mut self) {
         if self.buffer.len() != 0 {
             println!("MessageDeleteBuffer timeout. Flushing {} messages.", self.buffer.len());
@@ -278,6 +296,7 @@ pub struct MessageDeleteBufferActor {
 }
 
 impl MessageDeleteBufferActor {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new
     (actor: MessageDeleteBuffer)
      -> MessageDeleteBufferActor
@@ -286,13 +305,15 @@ impl MessageDeleteBufferActor {
         let (sender, receiver) = unbounded();
         let id = uuid::Uuid::new_v4().to_string();
         let recvr = receiver.clone();
+        let sendr = sender.clone();
+
         thread::spawn(
             move || {
                 loop {
                     if recvr.len() > 10 {
                         println!("MessageDeleteBufferActor queue len {}", recvr.len());
                     }
-                    match recvr.recv_timeout(Duration::from_secs(60)) {
+                    match recvr.recv_timeout(actor.flush_period) {
                         Ok(msg) => {
                             actor.route_msg(msg);
                             continue
@@ -301,7 +322,8 @@ impl MessageDeleteBufferActor {
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            println!("MessageDeleteBufferActor Haven't received a message in 10 seconds");
+                            sendr.send(MessageDeleteBufferMessage::Flush {});
+                            println!("MessageDeleteBufferActor flushing");
                             continue
                         }
                     }
@@ -315,6 +337,7 @@ impl MessageDeleteBufferActor {
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn delete_message(&self, receipt: String, init_time: Instant) {
         let msg = MessageDeleteBufferMessage::Delete {
             receipt,
@@ -323,11 +346,13 @@ impl MessageDeleteBufferActor {
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn flush(&self) {
         let msg = MessageDeleteBufferMessage::Flush {};
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn on_timeout(&self) {
         let msg = MessageDeleteBufferMessage::OnTimeout {};
         self.sender.send(msg).expect("All receivers have died.");
@@ -336,6 +361,7 @@ impl MessageDeleteBufferActor {
 
 impl MessageDeleteBuffer
 {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn route_msg(&mut self, msg: MessageDeleteBufferMessage) {
         match msg {
             MessageDeleteBufferMessage::Delete {
@@ -360,6 +386,7 @@ pub struct DeleteBufferFlusher
 
 impl DeleteBufferFlusher
 {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new(buffer: MessageDeleteBufferActor, period: Duration) -> DeleteBufferFlusher {
         DeleteBufferFlusher {
             buffer,
@@ -382,6 +409,7 @@ pub struct DeleteBufferFlusherActor {
 }
 
 impl DeleteBufferFlusherActor {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new(actor: DeleteBufferFlusher)
                -> DeleteBufferFlusherActor
     {
@@ -411,8 +439,8 @@ impl DeleteBufferFlusherActor {
                         actor.buffer.on_timeout();
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        println!("disconnected");
                         actor.buffer.on_timeout();
+                        println!("Disconnected");
                         break
                     }
                 }
@@ -426,11 +454,13 @@ impl DeleteBufferFlusherActor {
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn start(&self) {
         let msg = DeleteBufferFlushMessage::Start;
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn end(&self) {
         let msg = DeleteBufferFlushMessage::End;
         self.sender.send(msg).expect("All receivers have died.");

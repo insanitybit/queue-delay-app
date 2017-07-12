@@ -21,6 +21,7 @@ pub struct MessagePublisher<SN>
 impl<SN> MessagePublisher<SN>
     where SN: Sns + Send + Sync + 'static,
 {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new(sns_client: Arc<SN>, vis_manager: MessageStateManagerActor) -> MessagePublisher<SN> {
         MessagePublisher {
             sns_client,
@@ -28,6 +29,7 @@ impl<SN> MessagePublisher<SN>
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn publish_and_delete(&self, msg: DelayMessage, topic_arn: String, receipt: String) {
         match self.publish(msg.message, topic_arn) {
             Ok(_)   => {
@@ -56,6 +58,7 @@ impl<SN> MessagePublisher<SN>
 
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn route_msg(&self, msg: MessagePublisherMessage) {
         match msg {
             MessagePublisherMessage::PublishAndDelete {message, topic_arn, receipt}  =>
@@ -80,6 +83,7 @@ pub struct MessagePublisherActor {
 }
 
 impl MessagePublisherActor {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new<SN>(actor: MessagePublisher<SN>) -> MessagePublisherActor
         where SN: Sns + Send + Sync + 'static,
     {
@@ -112,6 +116,7 @@ impl MessagePublisherActor {
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn from_queue<SN, F>(
         new: &F,
         sender: Sender<MessagePublisherMessage>,
@@ -153,6 +158,7 @@ impl MessagePublisherActor {
         actor
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn publish_and_delete(&self, message: DelayMessage, topic_arn: String, receipt: String) {
         self.sender.send(MessagePublisherMessage::PublishAndDelete {
             message, topic_arn, receipt
@@ -170,6 +176,7 @@ pub struct MessagePublisherBroker
 
 impl MessagePublisherBroker
 {
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn new<T, F, SN>(new: F,
                          worker_count: usize,
                          max_queue_depth: T)
@@ -193,9 +200,11 @@ impl MessagePublisherBroker
         }
     }
 
+    #[cfg_attr(feature="flame_it", flame)]
     pub fn publish_and_delete(&self, message: DelayMessage, topic_arn: String, receipt: String) {
         self.sender.send(
             MessagePublisherMessage::PublishAndDelete { message, topic_arn, receipt}
         ).unwrap();
     }
 }
+

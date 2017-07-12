@@ -8,7 +8,7 @@ use two_lock_queue::{Sender, Receiver, RecvTimeoutError, unbounded, channel};
 use std::time::Duration;
 use rusoto_sns::Sns;
 use delay::DelayMessage;
-use util::{TopicCreator};
+use util::TopicCreator;
 use uuid::Uuid;
 use std::thread;
 
@@ -23,6 +23,7 @@ pub struct DelayMessageProcessor<SN>
 impl<SN> DelayMessageProcessor<SN>
     where SN: Sns + Send + Sync + 'static,
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(vis_manager: MessageStateManagerActor,
                publisher: MessagePublisherBroker,
                topic_creator: TopicCreator<SN>)
@@ -35,62 +36,62 @@ impl<SN> DelayMessageProcessor<SN>
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn process_message(&mut self, msg: SqsMessage) {
-        time!({
-            let receipt = match msg.receipt_handle.clone() {
-                Some(receipt)   => receipt,
-                None    => {
-                    println!("No receipt found for message in process_message");
-                    return
-                }
-            };
+        let receipt = match msg.receipt_handle.clone() {
+            Some(receipt) => receipt,
+            None => {
+                println!("No receipt found for message in process_message");
+                return;
+            }
+        };
 
-            let raw_body = match msg.body {
-                Some(ref body) => body.to_owned(),
-                None => {
-                    println!("Message has no body.");
-                    self.vis_manager.deregister(receipt, false);
-                    return;
-                }
-            };
+        let raw_body = match msg.body {
+            Some(ref body) => body.to_owned(),
+            None => {
+                println!("Message has no body.");
+                self.vis_manager.deregister(receipt, false);
+                return;
+            }
+        };
 
-            let body = decode(&raw_body);
+        let body = decode(&raw_body);
 
-            let body = match body {
-                Ok(body) => body,
-                Err(e) => {
+        let body = match body {
+            Ok(body) => body,
+            Err(e) => {
                 println!("Body was not base64 encoded: {}", e);
-                    self.vis_manager.deregister(receipt, false);
-                    return;
-                }
-            };
+                self.vis_manager.deregister(receipt, false);
+                return;
+            }
+        };
 
-            let delay_message: Result<DelayMessage, _> = serde_json::from_slice(&body[..]);
+        let delay_message: Result<DelayMessage, _> = serde_json::from_slice(&body[..]);
 
-            let delay_message = match delay_message {
-                Ok(m) => m,
-                Err(e) => {
+        let delay_message = match delay_message {
+            Ok(m) => m,
+            Err(e) => {
                 println!("Failed to deserialize delay message: {}", e);
-                    self.vis_manager.deregister(receipt, false);
-                    return;
-                }
-            };
+                self.vis_manager.deregister(receipt, false);
+                return;
+            }
+        };
 
-            let arn = self.topic_creator.get_or_create(delay_message.topic_name.clone());
+        let arn = self.topic_creator.get_or_create(delay_message.topic_name.clone());
 
-            let arn = match arn {
-                Ok(arn) => arn,
-                Err(e) => {
-                    println!("Failed to get arn with {}", e);
-                    self.vis_manager.deregister(receipt, false);
-                    return;
-                }
-            };
+        let arn = match arn {
+            Ok(arn) => arn,
+            Err(e) => {
+                println!("Failed to get arn with {}", e);
+                self.vis_manager.deregister(receipt, false);
+                return;
+            }
+        };
 
-            time!(self.publisher.publish_and_delete(delay_message, arn.get(), receipt));
-        }, "processor")
+        self.publisher.publish_and_delete(delay_message, arn.get(), receipt);
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn route_msg(&mut self, message: DelayMessageProcessorMessage) {
         match message {
             DelayMessageProcessorMessage::Process { message } => self.process_message(message)
@@ -110,6 +111,7 @@ pub struct DelayMessageProcessorActor {
 }
 
 impl DelayMessageProcessorActor {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn from_queue<SN, F>(new: &F,
                              sender: Sender<DelayMessageProcessorMessage>,
                              receiver: Receiver<DelayMessageProcessorMessage>)
@@ -152,6 +154,7 @@ impl DelayMessageProcessorActor {
         actor
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new<SN, F>(new: F)
                       -> DelayMessageProcessorActor
         where SN: Sns + Send + Sync + 'static,
@@ -172,7 +175,6 @@ impl DelayMessageProcessorActor {
         thread::spawn(
             move || {
                 loop {
-
                     if recvr.len() > 10 {
                         println!("DelayMessageProcessorActor queue len {}", recvr.len());
                     }
@@ -206,6 +208,7 @@ pub struct DelayMessageProcessorBroker
 
 impl DelayMessageProcessorBroker
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new<T, F, SN>(new: F,
                          worker_count: usize,
                          max_queue_depth: T)
@@ -229,6 +232,7 @@ impl DelayMessageProcessorBroker
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn process(&self, message: SqsMessage) {
         self.sender.send(
             DelayMessageProcessorMessage::Process { message }

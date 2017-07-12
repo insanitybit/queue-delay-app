@@ -13,50 +13,132 @@ use arrayvec::ArrayVec;
 use std::iter::Iterator;
 use std::thread;
 use delete::*;
+use consumer::{self, ConsumerThrottlerActor};
+use util::millis;
+
 use lru_time_cache::LruCache;
+use arraydeque::ArrayDeque;
+use std::cmp::{min, max};
+use std::iter::{self, FromIterator};
 
 /// The MessageStateManager manages the local message's state in the SQS service. That is, it will
 /// handle maintaining the messages visibility, and it will handle deleting the message
 /// Anything actors that may impact this state should likely be invoked or managed by this actor
-#[derive(Clone)]
 pub struct MessageStateManager
 {
-    timers: LruCache<String, VisibilityTimeoutActor>,
+    timers: LruCache<String, (VisibilityTimeoutActor, Instant)>,
     buffer: VisibilityTimeoutExtenderBufferActor,
-    deleter: MessageDeleteBufferActor
+    deleter: MessageDeleteBufferActor,
+    throttler: ConsumerThrottlerActor,
+    proc_times: ArrayDeque<[u32; 1024]>,
+    backlog_limit: usize
 }
 
 impl MessageStateManager
 {
-    pub fn new(buffer: VisibilityTimeoutExtenderBufferActor, deleter: MessageDeleteBufferActor) -> MessageStateManager
+    #[cfg_attr(feature = "flame_it", flame)]
+    pub fn new(buffer: VisibilityTimeoutExtenderBufferActor,
+               deleter: MessageDeleteBufferActor,
+               throttler: ConsumerThrottlerActor) -> MessageStateManager
     {
+        let proc_times = ArrayDeque::from_iter(
+            iter::repeat(120)
+        );
+
         // Create the new MessageStateManager with a maximum cache  lifetime of 12 hours, which is
         // the maximum amount of time a message can be kept invisible
         MessageStateManager {
             timers: LruCache::with_expiry_duration(Duration::from_secs(12 * 60 * 60)),
             buffer,
-            deleter
+            deleter,
+            throttler,
+            proc_times,
+            backlog_limit: 500
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn register(&mut self, receipt: String, visibility_timeout: Duration, start_time: Instant) {
         let vis_timeout = VisibilityTimeout::new(self.buffer.clone(), self.deleter.clone(), receipt.clone());
         let vis_timeout = VisibilityTimeoutActor::new(vis_timeout);
         vis_timeout.start(visibility_timeout, start_time);
 
-        self.timers.insert(receipt, vis_timeout);
+        self.timers.insert(receipt, (vis_timeout, start_time));
     }
 
+    fn handle_backlog(&self) {
+        if self.timers.len() > self.backlog_limit {
+            let backlog = self.timers.len() - self.backlog_limit;
+            let timeout = (millis(self.get_average_ms()) + 10) * backlog as u64;
+            println!("In Flight message count larger than backlog_limit: {}.\
+            Throttling: backlog {} for {}", self.backlog_limit, backlog, timeout);
+            self.throttler.throttle(Duration::from_millis(timeout));
+        } else {
+
+            let avg = millis(self.get_average_ms());
+
+            let additional = match self.backlog_limit - self.timers.len() {
+                0 ... 10 => 500,
+                10 ... 100 => 100,
+                100 ... 1000 => 10,
+                _ => 0
+            };
+
+            let timeout = avg + additional as u64;
+            println!("In Flight message count larger than backlog_limit: {}.\
+            Throttling: Preemptive throttle for {}", self.backlog_limit, timeout);
+            self.throttler.throttle(Duration::from_millis(timeout));
+        }
+    }
+
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn deregister(&mut self, receipt: String, should_delete: bool) {
         let vis_timeout = self.timers.remove(&receipt);
 
         match vis_timeout {
-            Some(vis_timeout) => vis_timeout.end(should_delete),
+            Some((vis_timeout, start_time)) => {
+                let now = Instant::now();
+
+                let proc_time = millis(now - start_time) as u32;
+
+                self.proc_times.pop_front();
+
+                self.proc_times.push_back(proc_time);
+
+                self.backlog_limit = self.get_max_backlog(Duration::from_secs(28)) as usize;
+
+                vis_timeout.end(should_delete);
+            }
             None => {
                 println!("Attempting to deregister timeout that does not exist:\
                 receipt: {} should_delete: {}", receipt, should_delete);
             }
         };
+    }
+
+    // Given a timeout of n seconds, and our current processing times,
+    // what is the number of messages we can process within that timeout
+    fn get_max_backlog(&self, dur: Duration) -> u64 {
+        let max_ms = millis(dur);
+        let proc_time = max(1, millis(self.get_average_ms()));
+
+        let max_msgs = max_ms / proc_time;
+
+        min(max_msgs, 10) as u64
+    }
+
+    fn get_average_ms(&self) -> Duration {
+        if self.proc_times.is_empty() {
+            Duration::from_millis(80)
+        } else {
+            let mut avg = 0;
+
+            for time in &self.proc_times {
+                avg += *time;
+                avg /= self.proc_times.len() as u32
+            }
+            Duration::from_millis(avg as u64)
+        }
     }
 }
 
@@ -77,6 +159,7 @@ pub struct MessageStateManagerActor {
 }
 
 impl MessageStateManagerActor {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(actor: MessageStateManager)
                -> MessageStateManagerActor
     {
@@ -88,9 +171,9 @@ impl MessageStateManagerActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 5 {
-                        println!("VisibilityTimeoutManagerActor queue len {}", recvr.len());
-                    }
+                    //                    if recvr.len() > 5 {
+                    ////                        println!("VisibilityTimeoutManagerActor queue len {}", recvr.len());
+                    //                    }
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             actor.route_msg(msg);
@@ -113,6 +196,7 @@ impl MessageStateManagerActor {
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn register(&self, receipt: String, visibility_timeout: Duration, start_time: Instant) {
         let msg = MessageStateManagerMessage::RegisterVariant {
             receipt,
@@ -122,6 +206,7 @@ impl MessageStateManagerActor {
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn deregister(&self, receipt: String, should_delete: bool) {
         if !should_delete {
             println!("Error when processing message, apparently!");
@@ -134,6 +219,7 @@ impl MessageStateManagerActor {
 
 impl MessageStateManager
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn route_msg(&mut self, msg: MessageStateManagerMessage) {
         match msg {
             MessageStateManagerMessage::RegisterVariant {
@@ -160,6 +246,7 @@ pub struct VisibilityTimeout
 
 impl VisibilityTimeout
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(buf: VisibilityTimeoutExtenderBufferActor,
                deleter: MessageDeleteBufferActor,
                receipt: String) -> VisibilityTimeout {
@@ -189,6 +276,7 @@ pub struct VisibilityTimeoutActor {
 }
 
 impl VisibilityTimeoutActor {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(actor: VisibilityTimeout) -> VisibilityTimeoutActor
     {
         let (sender, receiver): (Sender<VisibilityTimeoutMessage>, Receiver<VisibilityTimeoutMessage>) = unbounded();
@@ -236,7 +324,11 @@ impl VisibilityTimeoutActor {
                         }
                     }
                     Err(_) => {
-                        dur = dur * 2;
+                        let dur = match dur.checked_mul(2) {
+                            Some(d) => d,
+                            None => dur
+                        };
+
                         match _start_time {
                             Some(st) => {
                                 actor.buf.extend(receipt.clone(), dur, st.clone(), false);
@@ -258,6 +350,7 @@ impl VisibilityTimeoutActor {
     }
 
     // 'start' sets up the VisibilityTimeout with its initial timeout
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn start(&self, init_timeout: Duration, start_time: Instant) {
         self.sender.send(VisibilityTimeoutMessage::StartVariant {
             init_timeout,
@@ -266,6 +359,7 @@ impl VisibilityTimeoutActor {
     }
 
     // 'end' stops the VisibilityTimeout from emitting any more events
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn end(&self, should_delete: bool) {
         self.sender.send(VisibilityTimeoutMessage::EndVariant { should_delete })
             .expect("All receivers have died: VisibilityTimeoutMessage::EndVariant");
@@ -283,6 +377,7 @@ pub struct VisibilityTimeoutExtenderBroker
 
 impl VisibilityTimeoutExtenderBroker
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new<T, SQ, F>(new: F,
                          worker_count: usize,
                          max_queue_depth: T)
@@ -306,6 +401,7 @@ impl VisibilityTimeoutExtenderBroker
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         self.sender.send(
             VisibilityTimeoutExtenderMessage::ExtendVariant {
@@ -333,6 +429,7 @@ impl VisibilityTimeoutExtenderBuffer
 {
     // u8::MAX is just over 4 minutes
     // Highly suggest keep the number closer to 10s of seconds at most.
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(extender_broker: VisibilityTimeoutExtenderBroker, flush_period: u8) -> VisibilityTimeoutExtenderBuffer
 
     {
@@ -345,15 +442,14 @@ impl VisibilityTimeoutExtenderBuffer
     }
 
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&mut self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool) {
         if self.buffer.is_full() {
+            println!("MessageDeleteBuffer buffer full. Flushing.");
             self.flush();
         }
-        self.buffer.push((receipt, timeout, start_time, should_delete));
 
-        //        if should_delete {
-        //            self.flush()
-        //        }
+        self.buffer.push((receipt, timeout, start_time, should_delete));
     }
 
     fn dedup_cache(&mut self) {
@@ -366,11 +462,13 @@ impl VisibilityTimeoutExtenderBuffer
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn flush(&mut self) {
         self.extender_broker.extend(Vec::from(self.buffer.as_ref()));
         self.buffer.clear();
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn drop_message(&mut self, receipt: String) {
         if self.buffer.len() == 0 {
             println!("Race to clear buffer failed");
@@ -399,6 +497,7 @@ impl VisibilityTimeoutExtenderBuffer
         self.buffer.swap_remove(index);
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn on_timeout(&mut self) {
         if self.buffer.len() != 0 {
             println!("VisibilityTimeoutExtenderBuffer timeout. Flushing {:#?} messages.", self.buffer.len());
@@ -418,11 +517,11 @@ pub enum VisibilityTimeoutExtenderBufferMessage {
 pub struct VisibilityTimeoutExtenderBufferActor {
     sender: Sender<VisibilityTimeoutExtenderBufferMessage>,
     receiver: Receiver<VisibilityTimeoutExtenderBufferMessage>,
-    //    receiver: Receiver<VisibilityTimeoutExtenderBufferMessage>,
     id: String,
 }
 
 impl VisibilityTimeoutExtenderBufferActor {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(actor: VisibilityTimeoutExtenderBuffer)
                -> VisibilityTimeoutExtenderBufferActor
     {
@@ -436,7 +535,7 @@ impl VisibilityTimeoutExtenderBufferActor {
                     if recvr.len() > 5 {
                         println!("VisibilityTimeoutExtenderBuffer queue len {}", recvr.len());
                     }
-                    match recvr.recv_timeout(Duration::from_secs(60)) {
+                    match recvr.recv_timeout(actor.flush_period) {
                         Ok(msg) => {
                             actor.route_msg(msg);
                             continue
@@ -459,6 +558,7 @@ impl VisibilityTimeoutExtenderBufferActor {
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool) {
         let msg = VisibilityTimeoutExtenderBufferMessage::Extend {
             receipt,
@@ -469,16 +569,19 @@ impl VisibilityTimeoutExtenderBufferActor {
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn flush(&self) {
         let msg = VisibilityTimeoutExtenderBufferMessage::Flush {};
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn drop_message(&self, receipt: String) {
         let msg = VisibilityTimeoutExtenderBufferMessage::DropMessage { receipt };
         self.sender.send(msg).expect("All receivers have died")
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn on_timeout(&self) {
         let msg = VisibilityTimeoutExtenderBufferMessage::OnTimeout {};
         self.sender.send(msg).expect("All receivers have died.");
@@ -487,6 +590,7 @@ impl VisibilityTimeoutExtenderBufferActor {
 
 impl VisibilityTimeoutExtenderBuffer
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn route_msg(&mut self, msg: VisibilityTimeoutExtenderBufferMessage) {
         match msg {
             VisibilityTimeoutExtenderBufferMessage::Extend {
@@ -514,6 +618,7 @@ pub struct BufferFlushTimer
 
 impl BufferFlushTimer
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(buffer: VisibilityTimeoutExtenderBufferActor, period: Duration) -> BufferFlushTimer {
         BufferFlushTimer {
             buffer,
@@ -535,12 +640,13 @@ pub struct BufferFlushTimerActor {
 }
 
 impl BufferFlushTimerActor {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(actor: BufferFlushTimer) -> BufferFlushTimerActor
     {
         let (sender, receiver) = unbounded();
         let id = uuid::Uuid::new_v4().to_string();
         let recvr = receiver.clone();
-        
+
         thread::spawn(move || {
             loop {
                 if recvr.len() > 5 {
@@ -567,7 +673,6 @@ impl BufferFlushTimerActor {
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         actor.buffer.flush();
-                        break
                     }
                 }
             }
@@ -580,11 +685,13 @@ impl BufferFlushTimerActor {
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn start(&self) {
         let msg = BufferFlushTimerMessage::StartVariant;
         self.sender.send(msg).expect("All receivers have died.");
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn end(&self) {
         let msg = BufferFlushTimerMessage::End;
         self.sender.send(msg).expect("All receivers have died.");
@@ -607,6 +714,7 @@ pub struct VisibilityTimeoutExtender<SQ>
 impl<SQ> VisibilityTimeoutExtender<SQ>
     where SQ: Sqs + Send + Sync + 'static
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(sqs_client: Arc<SQ>, queue_url: String, deleter: MessageDeleteBufferActor) -> VisibilityTimeoutExtender<SQ> {
         VisibilityTimeoutExtender {
             sqs_client,
@@ -615,6 +723,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&mut self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         let mut id_map = HashMap::with_capacity(10);
 
@@ -702,6 +811,7 @@ pub struct VisibilityTimeoutExtenderActor {
 }
 
 impl VisibilityTimeoutExtenderActor {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn from_queue<SQ, F>(new: &F,
                              sender: Sender<VisibilityTimeoutExtenderMessage>,
                              receiver: Receiver<VisibilityTimeoutExtenderMessage>)
@@ -744,6 +854,7 @@ impl VisibilityTimeoutExtenderActor {
     }
 
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn new<SQ>(actor: VisibilityTimeoutExtender<SQ>) -> VisibilityTimeoutExtenderActor
         where SQ: Sqs + Send + Sync + 'static {
         let mut actor = actor;
@@ -778,6 +889,7 @@ impl VisibilityTimeoutExtenderActor {
         }
     }
 
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         let msg = VisibilityTimeoutExtenderMessage::ExtendVariant { timeout_info };
         self.sender.send(msg).expect("All receivers have died.");
@@ -787,6 +899,7 @@ impl VisibilityTimeoutExtenderActor {
 impl<SQ> VisibilityTimeoutExtender<SQ>
     where SQ: Sqs + Send + Sync + 'static
 {
+    #[cfg_attr(feature = "flame_it", flame)]
     pub fn route_msg(&mut self, msg: VisibilityTimeoutExtenderMessage) {
         match msg {
             VisibilityTimeoutExtenderMessage::ExtendVariant { timeout_info } => {
@@ -814,16 +927,47 @@ mod test {
     use slog_stdlog;
     use slog::{Drain, FnValue};
     use base64::encode;
-
+    use serde_json;
+    use delay::DelayMessage;
     #[cfg(feature = "flame_it")]
     use flame;
     use std::fs::File;
+    use uuid::Uuid;
 
     struct MockSqs {}
 
+    struct MockSns {}
+
     impl Sqs for MockSqs {
         fn receive_message(&self, input: &rusoto_sqs::ReceiveMessageRequest) -> Result<rusoto_sqs::ReceiveMessageResult, rusoto_sqs::ReceiveMessageError> {
-            unimplemented!()
+            thread::sleep(Duration::from_millis(1));
+
+            let mut messages = vec![];
+            for _ in 0..10 {
+                let delay_message = serde_json::to_string(
+                    &DelayMessage {
+                        message: Uuid::new_v4().to_string(),
+                        topic_name: "topic".to_owned(),
+                        correlation_id: Some("foo".to_owned()),
+                    }).unwrap();
+
+                messages.push(
+                    rusoto_sqs::Message {
+                        attributes: None,
+                        body: Some(encode(&delay_message)),
+                        md5_of_body: Some("md5body".to_owned()),
+                        md5_of_message_attributes: Some("md5attrs".to_owned()),
+                        message_attributes: None,
+                        message_id: Some(Uuid::new_v4().to_string()),
+                        receipt_handle: Some(Uuid::new_v4().to_string()),
+                    }
+                )
+            }
+
+            Ok(rusoto_sqs::ReceiveMessageResult {
+                messages: Some(messages)
+            }
+            )
         }
 
         fn add_permission(&self, input: &rusoto_sqs::AddPermissionRequest) -> Result<(), rusoto_sqs::AddPermissionError> {
@@ -834,6 +978,7 @@ mod test {
         fn change_message_visibility(&self,
                                      input: &rusoto_sqs::ChangeMessageVisibilityRequest)
                                      -> Result<(), rusoto_sqs::ChangeMessageVisibilityError> {
+            thread::sleep(Duration::from_millis(10));
             Ok(())
         }
 
@@ -842,7 +987,6 @@ mod test {
         (&self,
          input: &rusoto_sqs::ChangeMessageVisibilityBatchRequest)
          -> Result<rusoto_sqs::ChangeMessageVisibilityBatchResult, rusoto_sqs::ChangeMessageVisibilityBatchError> {
-            thread::sleep(Duration::from_millis(15)); // network latency
             Ok(
                 rusoto_sqs::ChangeMessageVisibilityBatchResult {
                     failed: vec![],
@@ -855,7 +999,11 @@ mod test {
         fn create_queue(&self,
                         input: &rusoto_sqs::CreateQueueRequest)
                         -> Result<rusoto_sqs::CreateQueueResult, rusoto_sqs::CreateQueueError> {
-            unimplemented!()
+            Ok(
+                rusoto_sqs::CreateQueueResult {
+                    queue_url: Some("queueurl".to_owned())
+                }
+            )
         }
 
 
@@ -867,7 +1015,7 @@ mod test {
         fn delete_message_batch(&self,
                                 input: &rusoto_sqs::DeleteMessageBatchRequest)
                                 -> Result<rusoto_sqs::DeleteMessageBatchResult, rusoto_sqs::DeleteMessageBatchError> {
-            thread::sleep(Duration::from_millis(10)); // network latency
+            thread::sleep(Duration::from_millis(10));
             Ok(
                 rusoto_sqs::DeleteMessageBatchResult {
                     failed: vec![],
@@ -942,44 +1090,335 @@ mod test {
         }
     }
 
+    impl Sns for MockSns {
+        fn add_permission(&self, input: &AddPermissionInput) -> Result<(), AddPermissionError> {
+            unimplemented!()
+        }
+
+
+        fn check_if_phone_number_is_opted_out
+        (&self,
+         input: &CheckIfPhoneNumberIsOptedOutInput)
+         -> Result<CheckIfPhoneNumberIsOptedOutResponse, CheckIfPhoneNumberIsOptedOutError> {
+            unimplemented!()
+        }
+
+
+        fn confirm_subscription(&self,
+                                input: &ConfirmSubscriptionInput)
+                                -> Result<ConfirmSubscriptionResponse, ConfirmSubscriptionError> {
+            unimplemented!()
+        }
+
+
+        fn create_platform_application
+        (&self,
+         input: &CreatePlatformApplicationInput)
+         -> Result<CreatePlatformApplicationResponse, CreatePlatformApplicationError> {
+            unimplemented!()
+        }
+
+
+        fn create_platform_endpoint(&self,
+                                    input: &CreatePlatformEndpointInput)
+                                    -> Result<CreateEndpointResponse, CreatePlatformEndpointError> {
+            unimplemented!()
+        }
+
+
+        fn create_topic(&self,
+                        input: &CreateTopicInput)
+                        -> Result<CreateTopicResponse, CreateTopicError> {
+            Ok(
+                CreateTopicResponse {
+                    topic_arn: Some("Arn".to_owned())
+                }
+            )
+        }
+
+
+        fn delete_endpoint(&self, input: &DeleteEndpointInput) -> Result<(), DeleteEndpointError> {
+            unimplemented!()
+        }
+
+
+        fn delete_platform_application(&self,
+                                       input: &DeletePlatformApplicationInput)
+                                       -> Result<(), DeletePlatformApplicationError> {
+            unimplemented!()
+        }
+
+
+        fn delete_topic(&self, input: &DeleteTopicInput) -> Result<(), DeleteTopicError> {
+            unimplemented!()
+        }
+
+
+        fn get_endpoint_attributes
+        (&self,
+         input: &GetEndpointAttributesInput)
+         -> Result<GetEndpointAttributesResponse, GetEndpointAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn get_platform_application_attributes
+        (&self,
+         input: &GetPlatformApplicationAttributesInput)
+         -> Result<GetPlatformApplicationAttributesResponse, GetPlatformApplicationAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn get_sms_attributes(&self,
+                              input: &GetSMSAttributesInput)
+                              -> Result<GetSMSAttributesResponse, GetSMSAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn get_subscription_attributes
+        (&self,
+         input: &GetSubscriptionAttributesInput)
+         -> Result<GetSubscriptionAttributesResponse, GetSubscriptionAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn get_topic_attributes(&self,
+                                input: &GetTopicAttributesInput)
+                                -> Result<GetTopicAttributesResponse, GetTopicAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn list_endpoints_by_platform_application
+        (&self,
+         input: &ListEndpointsByPlatformApplicationInput)
+         -> Result<ListEndpointsByPlatformApplicationResponse,
+             ListEndpointsByPlatformApplicationError> {
+            unimplemented!()
+        }
+
+
+        fn list_phone_numbers_opted_out
+        (&self,
+         input: &ListPhoneNumbersOptedOutInput)
+         -> Result<ListPhoneNumbersOptedOutResponse, ListPhoneNumbersOptedOutError> {
+            unimplemented!()
+        }
+
+
+        fn list_platform_applications
+        (&self,
+         input: &ListPlatformApplicationsInput)
+         -> Result<ListPlatformApplicationsResponse, ListPlatformApplicationsError> {
+            unimplemented!()
+        }
+
+
+        fn list_subscriptions(&self,
+                              input: &ListSubscriptionsInput)
+                              -> Result<ListSubscriptionsResponse, ListSubscriptionsError> {
+            unimplemented!()
+        }
+
+
+        fn list_subscriptions_by_topic
+        (&self,
+         input: &ListSubscriptionsByTopicInput)
+         -> Result<ListSubscriptionsByTopicResponse, ListSubscriptionsByTopicError> {
+            unimplemented!()
+        }
+
+
+        fn list_topics(&self, input: &ListTopicsInput) -> Result<ListTopicsResponse, ListTopicsError> {
+            unimplemented!()
+        }
+
+
+        fn opt_in_phone_number(&self,
+                               input: &OptInPhoneNumberInput)
+                               -> Result<OptInPhoneNumberResponse, OptInPhoneNumberError> {
+            unimplemented!()
+        }
+
+
+        fn publish(&self, input: &PublishInput) -> Result<PublishResponse, PublishError> {
+            thread::sleep(Duration::from_millis(15));
+            Ok(PublishResponse {
+                message_id: Some("id".to_owned())
+            })
+        }
+
+
+        fn remove_permission(&self,
+                             input: &RemovePermissionInput)
+                             -> Result<(), RemovePermissionError> {
+            unimplemented!()
+        }
+
+
+        fn set_endpoint_attributes(&self,
+                                   input: &SetEndpointAttributesInput)
+                                   -> Result<(), SetEndpointAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn set_platform_application_attributes(&self,
+                                               input: &SetPlatformApplicationAttributesInput)
+                                               -> Result<(), SetPlatformApplicationAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn set_sms_attributes(&self,
+                              input: &SetSMSAttributesInput)
+                              -> Result<SetSMSAttributesResponse, SetSMSAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn set_subscription_attributes(&self,
+                                       input: &SetSubscriptionAttributesInput)
+                                       -> Result<(), SetSubscriptionAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn set_topic_attributes(&self,
+                                input: &SetTopicAttributesInput)
+                                -> Result<(), SetTopicAttributesError> {
+            unimplemented!()
+        }
+
+
+        fn subscribe(&self, input: &SubscribeInput) -> Result<SubscribeResponse, SubscribeError> {
+            unimplemented!()
+        }
+
+
+        fn unsubscribe(&self, input: &UnsubscribeInput) -> Result<(), UnsubscribeError> {
+            unimplemented!()
+        }
+    }
+
 
     use fibers;
+    use processor::*;
+    use consumer::*;
+    use visibility::*;
+    use delete::*;
+    use publish::*;
+    use itertools::Itertools;
+    use futures_cpupool::CpuPool;
+    use dogstatsd::{Client, Options};
+    use hyper;
+    use util;
+    use util::TopicCreator;
 
     #[test]
     fn test_happy() {
-        set_timer();
+        util::set_timer();
+        let timer = util::get_timer();
+        let provider = util::get_profile_provider();
+        let queue_name = "local-dev-cobrien-TEST_QUEUE";
+        let queue_url = "some queue url".to_owned();
 
-        let sqs_client = Arc::new(MockSqs {});
-        let queue_url = "some url".to_owned();
+        let metrics = Arc::new(Client::new(Options::default()).expect("Failure to create metrics"));
 
-        let extender = VisibilityTimeoutExtender::new(sqs_client.clone(), queue_url.clone());
-        let extender = VisibilityTimeoutExtenderActor::new(extender);
+        let sqs_client = Arc::new(new_sqs_client(&provider));
+
+        let deleter = MessageDeleterBroker::new(
+            |_| {
+                MessageDeleter::new(sqs_client.clone(), queue_url.clone())
+            },
+            350,
+            None
+        );
+
+        let deleter = MessageDeleteBuffer::new(deleter, Duration::from_millis(50));
+        let deleter = MessageDeleteBufferActor::new(deleter);
+
+        let delete_flusher = DeleteBufferFlusher::new(deleter.clone(), Duration::from_secs(1));
+        DeleteBufferFlusherActor::new(delete_flusher.clone());
+
+        let sqs_client = Arc::new(new_sqs_client(&provider));
+        let sns_client = Arc::new(new_sns_client(&provider));
 
         let broker = VisibilityTimeoutExtenderBroker::new(
             |actor| {
-                VisibilityTimeoutExtender::new(sqs_client.clone(), queue_url.clone())
+                VisibilityTimeoutExtender::new(sqs_client.clone(), queue_url.clone(), deleter.clone())
             },
-            10,
-            None);
+            550,
+            None
+        );
 
-
-        let buffer = VisibilityTimeoutExtenderBuffer::new(broker, 4);
+        let buffer = VisibilityTimeoutExtenderBuffer::new(broker, 2);
         let buffer = VisibilityTimeoutExtenderBufferActor::new(buffer);
 
-        let flusher = BufferFlushTimer::new(buffer.clone(), Duration::from_secs(1));
-        BufferFlushTimerActor::new(flusher);
+        let flusher = BufferFlushTimer::new(buffer.clone(), Duration::from_millis(200));
+        let flusher = BufferFlushTimerActor::new(flusher);
 
-        let timeout_manager = MessageStateManager::new(Timer::default(), buffer);
-        let timeout_manager = MessageStateManagerActor::new(timeout_manager);
+        let consumer_throttler = ConsumerThrottler::new();
+        let consumer_throttler = ConsumerThrottlerActor::new(consumer_throttler);
 
-        for i in 0..500 {
-            timeout_manager.register(format!("receipt{}", i), Duration::from_secs(30));
+        let state_manager = MessageStateManager::new(buffer, deleter.clone(), consumer_throttler.clone());
+        let state_manager = MessageStateManagerActor::new(state_manager);
+
+        let publisher = MessagePublisherBroker::new(
+            |actor| {
+                MessagePublisher::new(sns_client.clone(), state_manager.clone())
+            },
+            500,
+            None
+        );
+
+        let processor = DelayMessageProcessorBroker::new(
+            |actor| {
+                DelayMessageProcessor::new(state_manager.clone(), publisher.clone(), TopicCreator::new(sns_client.clone()))
+            },
+            100,
+            100_000
+        );
+
+        let sqs_client = Arc::new(new_sqs_client(&provider));
+        let sqs_broker = DelayMessageConsumerBroker::new(
+            |actor| {
+                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone())
+            },
+            10,
+            None
+        );
+
+        consumer_throttler.register_consumer(sqs_broker.clone());
+
+        // Maximum number of in flight messages
+        for worker in sqs_broker.workers {
+            worker.consume()
         }
 
-        pool.run();
+        println!("consumers started");
 
+        //        thread::sleep(Duration::from_secs(10));
+        //        println!("Writing stats to disk");
+        ////        flame::dump_html(&mut File::create("flame-graph.html").unwrap()).unwrap();
+        //        thread::sleep(Duration::from_secs(120));
         loop {
             thread::park()
         }
+    }
+
+    fn new_sqs_client<P>(sqs_provider: &P) -> MockSqs
+        where P: ProvideAwsCredentials + Clone + Send + 'static
+    {
+        MockSqs {}
+    }
+
+    fn new_sns_client<P>(sns_provider: &P) -> MockSns
+        where P: ProvideAwsCredentials + Clone + Send + 'static
+    {
+        MockSns {}
     }
 }

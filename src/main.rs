@@ -21,6 +21,7 @@ extern crate base64;
 extern crate dogstatsd;
 extern crate env_logger;
 extern crate arrayvec;
+extern crate arraydeque;
 extern crate rusoto_sqs;
 extern crate rusoto_sns;
 extern crate rusoto_core;
@@ -94,9 +95,13 @@ mod delete;
 mod publish;
 mod processor;
 mod consumer;
+mod autoscaling;
 
 use processor::*;
 use consumer::*;
+use visibility::*;
+use delete::*;
+use publish::*;
 
 use futures_cpupool::CpuPool;
 
@@ -107,14 +112,11 @@ use slog::{Drain, FnValue};
 use dogstatsd::{Client, Options};
 use std::sync::Arc;
 use util::*;
-use itertools::Itertools;
-use visibility::*;
-use delete::*;
-use publish::*;
 use std::time::Duration;
 
 const PROCESSOR_COUNT: usize = 10;
 const CONSUMER_COUNT: usize = 10;
+
 
 fn main() {
     set_timer();
@@ -165,17 +167,17 @@ fn main() {
         None
     );
 
-    let deleter = MessageDeleteBuffer::new(deleter, 1);
-    let deleter = MessageDeleteBufferActor::new(deleter);
+    let consumer_throttler = ConsumerThrottler::new();
+    let consumer_throttler = ConsumerThrottlerActor::new(consumer_throttler);
 
-    let delete_flusher = DeleteBufferFlusher::new(deleter.clone(), Duration::from_secs(1));
-    DeleteBufferFlusherActor::new(delete_flusher.clone());
+    let deleter = MessageDeleteBuffer::new(deleter, Duration::from_millis(1));
+    let deleter = MessageDeleteBufferActor::new(deleter);
 
     let sqs_client = Arc::new(new_sqs_client(&provider));
     let sns_client = Arc::new(new_sns_client(&provider));
 
     let broker = VisibilityTimeoutExtenderBroker::new(
-        |actor| {
+        |_| {
             VisibilityTimeoutExtender::new(sqs_client.clone(), queue_url.clone(), deleter.clone())
         },
         550,
@@ -186,38 +188,44 @@ fn main() {
     let buffer = VisibilityTimeoutExtenderBufferActor::new(buffer);
 
     let flusher = BufferFlushTimer::new(buffer.clone(), Duration::from_millis(200));
-    std::mem::forget(BufferFlushTimerActor::new(flusher));
+    let flusher = BufferFlushTimerActor::new(flusher);
+    std::mem::forget(flusher);
 
-    let timeout_manager = MessageStateManager::new(buffer, deleter.clone());
-    let timeout_manager = MessageStateManagerActor::new(timeout_manager);
+    let state_manager = MessageStateManager::new(buffer, deleter.clone(), consumer_throttler.clone());
+    let state_manager = MessageStateManagerActor::new(state_manager);
 
     let publisher = MessagePublisherBroker::new(
-        |actor| {
-            MessagePublisher::new(sns_client.clone(), timeout_manager.clone())
+        |_| {
+            MessagePublisher::new(sns_client.clone(), state_manager.clone())
         },
         500,
         None
     );
 
     let processor = DelayMessageProcessorBroker::new(
-        |actor| {
-            DelayMessageProcessor::new(timeout_manager.clone(), publisher.clone(), TopicCreator::new(sns_client.clone()))
+        |_| {
+            DelayMessageProcessor::new(state_manager.clone(), publisher.clone(), TopicCreator::new(sns_client.clone()))
         },
         PROCESSOR_COUNT,
         None
     );
 
     let sqs_client = Arc::new(new_sqs_client(&provider));
-    let consumers: Vec<_> = (0..CONSUMER_COUNT).map(|_| {
-        DelayMessageConsumerActor::new(
+
+    let sqs_broker = DelayMessageConsumerBroker::new(
             |actor| {
-                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, timeout_manager.clone(), processor.clone())
-            })
-    }).collect();
+                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone())
+            },
+        10,
+        None
+    );
 
+    consumer_throttler.register_consumer(sqs_broker.clone());
 
-    consumers.iter().foreach(|c| c.consume());
-
+    // Maximum number of in flight messages
+    for worker in sqs_broker.workers {
+        worker.consume()
+    }
     println!("consumers started");
 
     loop {

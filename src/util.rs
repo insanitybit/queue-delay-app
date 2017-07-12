@@ -4,7 +4,7 @@ use futures_cpupool::CpuPool;
 use tokio_timer::*;
 use futures::*;
 use futures::future::ok;
-use std::time::*;
+use std::time::{Instant, Duration};
 
 use rusoto_sns::{Sns};
 
@@ -18,6 +18,9 @@ use hyper;
 
 static mut TIMER: Option<Timer> = None;
 
+const NANOS_PER_MILLI: u32 = 1000_000;
+const MILLIS_PER_SEC: u64 = 1000;
+
 pub fn set_timer() {
     unsafe {
         TIMER = Some(Timer::default());
@@ -30,6 +33,14 @@ pub fn get_timer() -> Timer {
     }
 }
 
+
+pub fn millis(d: Duration) -> u64 {
+    // A proper Duration will not overflow, because MIN and MAX are defined
+    // such that the range is exactly i64 milliseconds.
+    let secs_part = d.as_secs() * MILLIS_PER_SEC;
+    let nanos_part = d.subsec_nanos() / NANOS_PER_MILLI;
+    secs_part + nanos_part as u64
+}
 
 #[cfg_attr(feature = "flame_it", flame)]
 pub fn new_sqs_client<P>(sqs_provider: &P) -> SqsClient<P, hyper::Client>
