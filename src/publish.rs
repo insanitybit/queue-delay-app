@@ -42,7 +42,7 @@ impl<SN> MessagePublisher<SN>
         }
     }
 
-    fn publish(&self, message: String, topic_arn: String) -> Result<(), String> {
+    pub fn publish(&self, message: String, topic_arn: String) -> Result<(), String> {
         let topic_arn = Some(topic_arn);
         let input = PublishInput {
             message,

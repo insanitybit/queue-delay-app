@@ -29,31 +29,20 @@ pub struct MessageStateManager
     timers: LruCache<String, (VisibilityTimeoutActor, Instant)>,
     buffer: VisibilityTimeoutExtenderBufferActor,
     deleter: MessageDeleteBufferActor,
-    throttler: ConsumerThrottlerActor,
-    proc_times: ArrayDeque<[u32; 1024]>,
-    backlog_limit: usize
 }
 
 impl MessageStateManager
 {
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn new(buffer: VisibilityTimeoutExtenderBufferActor,
-               deleter: MessageDeleteBufferActor,
-               throttler: ConsumerThrottlerActor) -> MessageStateManager
+               deleter: MessageDeleteBufferActor) -> MessageStateManager
     {
-        let proc_times = ArrayDeque::from_iter(
-            iter::repeat(120)
-        );
-
         // Create the new MessageStateManager with a maximum cache  lifetime of 12 hours, which is
         // the maximum amount of time a message can be kept invisible
         MessageStateManager {
             timers: LruCache::with_expiry_duration(Duration::from_secs(12 * 60 * 60)),
             buffer,
             deleter,
-            throttler,
-            proc_times,
-            backlog_limit: 500
         }
     }
 
@@ -66,47 +55,12 @@ impl MessageStateManager
         self.timers.insert(receipt, (vis_timeout, start_time));
     }
 
-    fn handle_backlog(&self) {
-        if self.timers.len() > self.backlog_limit {
-            let backlog = self.timers.len() - self.backlog_limit;
-            let timeout = (millis(self.get_average_ms()) + 10) * backlog as u64;
-            println!("In Flight message count larger than backlog_limit: {}.\
-            Throttling: backlog {} for {}", self.backlog_limit, backlog, timeout);
-            self.throttler.throttle(Duration::from_millis(timeout));
-        } else {
-
-            let avg = millis(self.get_average_ms());
-
-            let additional = match self.backlog_limit - self.timers.len() {
-                0 ... 10 => 500,
-                10 ... 100 => 100,
-                100 ... 1000 => 10,
-                _ => 0
-            };
-
-            let timeout = avg + additional as u64;
-            println!("In Flight message count larger than backlog_limit: {}.\
-            Throttling: Preemptive throttle for {}", self.backlog_limit, timeout);
-            self.throttler.throttle(Duration::from_millis(timeout));
-        }
-    }
-
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn deregister(&mut self, receipt: String, should_delete: bool) {
         let vis_timeout = self.timers.remove(&receipt);
 
         match vis_timeout {
             Some((vis_timeout, start_time)) => {
-                let now = Instant::now();
-
-                let proc_time = millis(now - start_time) as u32;
-
-                self.proc_times.pop_front();
-
-                self.proc_times.push_back(proc_time);
-
-                self.backlog_limit = self.get_max_backlog(Duration::from_secs(28)) as usize;
-
                 vis_timeout.end(should_delete);
             }
             None => {
@@ -114,31 +68,6 @@ impl MessageStateManager
                 receipt: {} should_delete: {}", receipt, should_delete);
             }
         };
-    }
-
-    // Given a timeout of n seconds, and our current processing times,
-    // what is the number of messages we can process within that timeout
-    fn get_max_backlog(&self, dur: Duration) -> u64 {
-        let max_ms = millis(dur);
-        let proc_time = max(1, millis(self.get_average_ms()));
-
-        let max_msgs = max_ms / proc_time;
-
-        min(max_msgs, 10) as u64
-    }
-
-    fn get_average_ms(&self) -> Duration {
-        if self.proc_times.is_empty() {
-            Duration::from_millis(80)
-        } else {
-            let mut avg = 0;
-
-            for time in &self.proc_times {
-                avg += *time;
-                avg /= self.proc_times.len() as u32
-            }
-            Duration::from_millis(avg as u64)
-        }
     }
 }
 
@@ -1309,6 +1238,7 @@ mod test {
     use processor::*;
     use consumer::*;
     use visibility::*;
+    use autoscaling::*;
     use delete::*;
     use publish::*;
     use itertools::Itertools;
@@ -1317,7 +1247,7 @@ mod test {
     use hyper;
     use util;
     use util::TopicCreator;
-
+    use xorshift::{self, Rng};
     #[test]
     fn test_happy() {
         util::set_timer();
@@ -1330,9 +1260,13 @@ mod test {
 
         let sqs_client = Arc::new(new_sqs_client(&provider));
 
+
+        let throttler = Throttler::new();
+        let throttler = ThrottlerActor::new(throttler);
+
         let deleter = MessageDeleterBroker::new(
             |_| {
-                MessageDeleter::new(sqs_client.clone(), queue_url.clone())
+                MessageDeleter::new(sqs_client.clone(), queue_url.clone(), throttler.clone())
             },
             350,
             None
@@ -1364,41 +1298,45 @@ mod test {
         let consumer_throttler = ConsumerThrottler::new();
         let consumer_throttler = ConsumerThrottlerActor::new(consumer_throttler);
 
-        let state_manager = MessageStateManager::new(buffer, deleter.clone(), consumer_throttler.clone());
+        let state_manager = MessageStateManager::new(buffer, deleter.clone());
         let state_manager = MessageStateManagerActor::new(state_manager);
 
-        let publisher = MessagePublisherBroker::new(
-            |actor| {
-                MessagePublisher::new(sns_client.clone(), state_manager.clone())
-            },
-            500,
-            None
-        );
-
         let processor = DelayMessageProcessorBroker::new(
-            |actor| {
-                DelayMessageProcessor::new(state_manager.clone(), publisher.clone(), TopicCreator::new(sns_client.clone()))
+            |_| {
+                let publisher = MessagePublisher::new(sns_client.clone(), state_manager.clone());
+                DelayMessageProcessor::new(publisher, TopicCreator::new(sns_client.clone()))
             },
-            100,
-            100_000
+            10,
+            None,
+            state_manager.clone()
         );
 
         let sqs_client = Arc::new(new_sqs_client(&provider));
         let sqs_broker = DelayMessageConsumerBroker::new(
             |actor| {
-                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone())
+                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone(), throttler.clone())
             },
-            10,
+            1,
             None
         );
 
         consumer_throttler.register_consumer(sqs_broker.clone());
 
-        // Maximum number of in flight messages
-        for worker in sqs_broker.workers {
-            worker.consume()
-        }
+        throttler.register_consumer_throttler(consumer_throttler);
 
+
+        let mut sm: xorshift::SplitMix64 = xorshift::SeedableRng::from_seed(1);
+        let mut rng: xorshift::Xoroshiro128 = xorshift::Rand::rand(&mut sm);
+
+        let mut workers = sqs_broker.workers.iter();
+        let first = workers.next().unwrap();
+        first.consume();
+
+        thread::sleep(Duration::from_secs(2));
+        for worker in workers {
+            worker.consume();
+            worker.throttle(Duration::from_millis(rng.gen_range(150,1500)))
+        }
         println!("consumers started");
 
         //        thread::sleep(Duration::from_secs(10));

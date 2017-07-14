@@ -11,6 +11,7 @@ use std::sync::Arc;
 use arrayvec::ArrayVec;
 use std::iter::Iterator;
 use std::thread;
+use autoscaling::*;
 
 #[derive(Clone)]
 pub struct MessageDeleter<SQ>
@@ -18,22 +19,29 @@ pub struct MessageDeleter<SQ>
 {
     sqs_client: Arc<SQ>,
     queue_url: String,
+    throttler: ThrottlerActor
 }
 
 impl<SQ> MessageDeleter<SQ>
     where SQ: Sqs + Send + Sync + 'static,
 {
     #[cfg_attr(feature="flame_it", flame)]
-    pub fn new(sqs_client: Arc<SQ>, queue_url: String) -> MessageDeleter<SQ> {
+    pub fn new(sqs_client: Arc<SQ>, queue_url: String, throttler: ThrottlerActor) -> MessageDeleter<SQ> {
         MessageDeleter {
             sqs_client,
-            queue_url
+            queue_url,
+            throttler
         }
     }
 
     #[cfg_attr(feature="flame_it", flame)]
     pub fn delete_messages(&self, receipts: Vec<(String, Instant)>) {
         let msg_count = receipts.len();
+
+        if msg_count == 0 {
+            return
+        }
+
         println!("Deleting {} messages", msg_count);
 
         let mut receipt_init_map = HashMap::new();
@@ -80,6 +88,10 @@ impl<SQ> MessageDeleter<SQ>
                     backoff += 1;
                 }
             }
+        }
+
+        for receipt in receipt_init_map.keys().cloned() {
+            self.throttler.message_stop(receipt, Instant::now(), true)
         }
 
     }

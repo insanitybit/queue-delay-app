@@ -17,7 +17,7 @@ extern crate slog_term;
 extern crate serde_derive;
 
 extern crate base64;
-
+extern crate xorshift;
 extern crate dogstatsd;
 extern crate env_logger;
 extern crate arrayvec;
@@ -97,6 +97,7 @@ mod processor;
 mod consumer;
 mod autoscaling;
 
+use autoscaling::*;
 use processor::*;
 use consumer::*;
 use visibility::*;
@@ -113,6 +114,7 @@ use dogstatsd::{Client, Options};
 use std::sync::Arc;
 use util::*;
 use std::time::Duration;
+use xorshift::Rng;
 
 const PROCESSOR_COUNT: usize = 10;
 const CONSUMER_COUNT: usize = 10;
@@ -159,9 +161,14 @@ fn main() {
 
     let sqs_client = Arc::new(new_sqs_client(&provider));
 
+
+    let throttler = Throttler::new();
+    let throttler = ThrottlerActor::new(throttler);
+
+
     let deleter = MessageDeleterBroker::new(
         |_| {
-            MessageDeleter::new(sqs_client.clone(), queue_url.clone())
+            MessageDeleter::new(sqs_client.clone(), queue_url.clone(), throttler.clone())
         },
         350,
         None
@@ -191,30 +198,24 @@ fn main() {
     let flusher = BufferFlushTimerActor::new(flusher);
     std::mem::forget(flusher);
 
-    let state_manager = MessageStateManager::new(buffer, deleter.clone(), consumer_throttler.clone());
+    let state_manager = MessageStateManager::new(buffer, deleter.clone());
     let state_manager = MessageStateManagerActor::new(state_manager);
-
-    let publisher = MessagePublisherBroker::new(
-        |_| {
-            MessagePublisher::new(sns_client.clone(), state_manager.clone())
-        },
-        500,
-        None
-    );
 
     let processor = DelayMessageProcessorBroker::new(
         |_| {
-            DelayMessageProcessor::new(state_manager.clone(), publisher.clone(), TopicCreator::new(sns_client.clone()))
+            let publisher = MessagePublisher::new(sns_client.clone(), state_manager.clone());
+            DelayMessageProcessor::new(publisher, TopicCreator::new(sns_client.clone()))
         },
         PROCESSOR_COUNT,
-        None
+        None,
+        state_manager.clone()
     );
 
     let sqs_client = Arc::new(new_sqs_client(&provider));
 
     let sqs_broker = DelayMessageConsumerBroker::new(
             |actor| {
-                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone())
+                DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone(), throttler.clone())
             },
         10,
         None
@@ -222,9 +223,19 @@ fn main() {
 
     consumer_throttler.register_consumer(sqs_broker.clone());
 
-    // Maximum number of in flight messages
-    for worker in sqs_broker.workers {
-        worker.consume()
+    throttler.register_consumer_throttler(consumer_throttler);
+
+    let mut sm: xorshift::SplitMix64 = xorshift::SeedableRng::from_seed(1);
+    let mut rng: xorshift::Xoroshiro128 = xorshift::Rand::rand(&mut sm);
+
+    let mut workers = sqs_broker.workers.iter();
+    let first = workers.next().unwrap();
+    first.consume();
+
+    thread::sleep(Duration::from_secs(2));
+    for worker in workers {
+        worker.consume();
+        worker.throttle(Duration::from_millis(rng.gen_range(150,1500)))
     }
     println!("consumers started");
 

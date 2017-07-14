@@ -6,6 +6,7 @@ use dogstatsd::{Client};
 use std::sync::Arc;
 use slog_scope;
 use visibility::*;
+use autoscaling::*;
 use uuid;
 
 use processor::*;
@@ -22,7 +23,8 @@ pub struct DelayMessageConsumer<SQ>
     metrics: Arc<Client>,
     actor: DelayMessageConsumerActor,
     vis_manager: MessageStateManagerActor,
-    processor: DelayMessageProcessorBroker
+    processor: DelayMessageProcessorBroker,
+    throttler: ThrottlerActor
 }
 
 impl<SQ> DelayMessageConsumer<SQ>
@@ -34,7 +36,8 @@ impl<SQ> DelayMessageConsumer<SQ>
                metrics: Arc<Client>,
                actor: DelayMessageConsumerActor,
                vis_manager: MessageStateManagerActor,
-               processor: DelayMessageProcessorBroker)
+               processor: DelayMessageProcessorBroker,
+               throttler: ThrottlerActor)
                -> DelayMessageConsumer<SQ>
     {
         DelayMessageConsumer {
@@ -43,7 +46,8 @@ impl<SQ> DelayMessageConsumer<SQ>
             metrics,
             actor,
             vis_manager,
-            processor
+            processor,
+            throttler
         }
     }
 
@@ -79,7 +83,9 @@ impl<SQ> DelayMessageConsumer<SQ>
             let messages: Vec<_> = messages.iter().filter_map(|msg| {
                 match msg.receipt_handle {
                     Some(ref receipt) if msg.body.is_some() => {
-                        self.vis_manager.register(receipt.to_owned(), Duration::from_secs(30), Instant::now());
+                        let now = Instant::now();
+                        self.vis_manager.register(receipt.to_owned(), Duration::from_secs(30), now.clone());
+                        self.throttler.message_start(receipt.to_owned(), now.clone());
                         Some(msg)
                     }
                     _   => None
@@ -99,10 +105,10 @@ impl<SQ> DelayMessageConsumer<SQ>
         thread::sleep(how_long);
     }
 
-    fn route_msg(&self, msg: DelayMessageConsumerMessage) {
+    fn route_msg(&mut self, msg: DelayMessageConsumerMessage) {
         match msg {
             DelayMessageConsumerMessage::Consume  => self.consume(),
-            DelayMessageConsumerMessage::Throttle {how_long}    => self.throttle(how_long)
+            DelayMessageConsumerMessage::Throttle {how_long}    => self.throttle(how_long),
         };
 
         self.actor.consume();
@@ -123,11 +129,10 @@ impl<SQ> DelayMessageConsumer<SQ>
     }
 }
 
-#[derive(Debug)]
 pub enum DelayMessageConsumerMessage
 {
     Consume,
-    Throttle {how_long: Duration}
+    Throttle {how_long: Duration},
 }
 
 #[derive(Clone)]
@@ -219,7 +224,6 @@ impl DelayMessageConsumerActor
             move || {
                 loop {
                     if let Ok(msg) = p_recvr.try_recv() {
-                        println!("routing msg: {:#?}", msg);
                         _actor.route_msg(msg);
                         continue
                     }
@@ -313,6 +317,7 @@ impl DelayMessageConsumerBroker
             DelayMessageConsumerMessage::Throttle {how_long}
         ).unwrap();
     }
+
 }
 
 #[derive(Clone)]
