@@ -1,8 +1,7 @@
 use two_lock_queue::{unbounded, Sender, Receiver, RecvTimeoutError, channel};
 use uuid;
 
-use chrono;
-
+use util::*;
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use rusoto_sqs::{Sqs, DeleteMessageBatchRequest, DeleteMessageBatchRequestEntry};
@@ -42,9 +41,8 @@ impl<SQ> MessageDeleter<SQ>
             return
         }
 
-        println!("Deleting {} messages", msg_count);
 
-        let mut receipt_init_map = HashMap::new();
+        let mut receipt_init_map = HashMap::with_capacity(receipts.len());
 
         for (receipt, time) in receipts {
             receipt_init_map.insert(receipt, time);
@@ -57,6 +55,7 @@ impl<SQ> MessageDeleter<SQ>
         }
         }).collect();
 
+        println!("Deleting {} messages", msg_count);
 
         let req = DeleteMessageBatchRequest {
             entries,
@@ -72,11 +71,8 @@ impl<SQ> MessageDeleter<SQ>
                     for init_time in receipt_init_map.values() {
                         let dur = now - *init_time;
 
-                        match chrono::Duration::from_std(dur) {
-                            Ok(dur) => println!("Took {}ms to process message to deletion",
-                                dur.num_milliseconds()),
-                            Err(e)  => println!("Failed to time {}", e)
-                        }
+                        let dur = millis(dur);
+                        println!("Took {}ms to process message to deletion", dur)
                     }
                     break
                 },
@@ -189,7 +185,6 @@ impl MessageDeleterActor {
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            println!("MessageDeleteActor Haven't received a message in 10 seconds");
                             continue
                         }
                     }
@@ -269,7 +264,6 @@ impl MessageDeleteBuffer {
     #[cfg_attr(feature="flame_it", flame)]
     pub fn delete_message(&mut self, receipt: String, init_time: Instant) {
         if self.buffer.is_full() {
-            println!("MessageDeleteBuffer buffer full. Flushing.");
             self.flush();
         }
 
@@ -285,7 +279,6 @@ impl MessageDeleteBuffer {
     #[cfg_attr(feature="flame_it", flame)]
     pub fn on_timeout(&mut self) {
         if self.buffer.len() != 0 {
-            println!("MessageDeleteBuffer timeout. Flushing {} messages.", self.buffer.len());
             self.flush();
         }
     }
@@ -335,7 +328,6 @@ impl MessageDeleteBufferActor {
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             sendr.send(MessageDeleteBufferMessage::Flush {});
-                            println!("MessageDeleteBufferActor flushing");
                             continue
                         }
                     }
@@ -355,19 +347,19 @@ impl MessageDeleteBufferActor {
             receipt,
             init_time
         };
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("MessageDeleteBufferActor :All receivers have died.");
     }
 
     #[cfg_attr(feature="flame_it", flame)]
     pub fn flush(&self) {
         let msg = MessageDeleteBufferMessage::Flush {};
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("MessageDeleteBufferActor.flush :All receivers have died.");
     }
 
     #[cfg_attr(feature="flame_it", flame)]
     pub fn on_timeout(&self) {
         let msg = MessageDeleteBufferMessage::OnTimeout {};
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("MessageDeleteBufferActor.on_timeout :All receivers have died.");
     }
 }
 
@@ -469,12 +461,12 @@ impl DeleteBufferFlusherActor {
     #[cfg_attr(feature="flame_it", flame)]
     pub fn start(&self) {
         let msg = DeleteBufferFlushMessage::Start;
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("DeleteBufferFlusherActor.start : All receivers have died.");
     }
 
     #[cfg_attr(feature="flame_it", flame)]
     pub fn end(&self) {
         let msg = DeleteBufferFlushMessage::End;
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("DeleteBufferFlusherActor.end : All receivers have died.");
     }
 }

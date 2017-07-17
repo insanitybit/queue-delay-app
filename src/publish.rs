@@ -50,12 +50,22 @@ impl<SN> MessagePublisher<SN>
             ..Default::default()
         };
 
-        let res = self.sns_client.publish(&input);
-        match res {
-            Ok(_)   => Ok(()),
-            Err(e)  => Err(e.description().to_owned())
+        let mut backoff = 0;
+        loop {
+            let res = self.sns_client.publish(&input);
+            match res {
+                Ok(_)   => {
+                    return Ok(())
+                },
+                Err(e)  => {
+                    backoff += 1;
+                    thread::sleep(Duration::from_secs(20 * backoff));
+                    if backoff > 3 {
+                        return Err(e.description().to_owned())
+                    }
+                }
+            }
         }
-
     }
 
     #[cfg_attr(feature="flame_it", flame)]
@@ -148,7 +158,6 @@ impl MessagePublisherActor {
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            println!("Haven't received a message in 10 seconds");
                             continue
                         }
                     }

@@ -14,12 +14,10 @@ use std::iter::Iterator;
 use std::thread;
 use delete::*;
 use consumer::{self, ConsumerThrottlerActor};
-use util::millis;
 
 use lru_time_cache::LruCache;
-use arraydeque::ArrayDeque;
 use std::cmp::{min, max};
-use std::iter::{self, FromIterator};
+use std::iter::FromIterator;
 
 /// The MessageStateManager manages the local message's state in the SQS service. That is, it will
 /// handle maintaining the messages visibility, and it will handle deleting the message
@@ -40,7 +38,7 @@ impl MessageStateManager
         // Create the new MessageStateManager with a maximum cache  lifetime of 12 hours, which is
         // the maximum amount of time a message can be kept invisible
         MessageStateManager {
-            timers: LruCache::with_expiry_duration(Duration::from_secs(12 * 60 * 60)),
+            timers: LruCache::with_expiry_duration_and_capacity(Duration::from_secs(12 * 60 * 60), 120_000),
             buffer,
             deleter,
         }
@@ -60,7 +58,7 @@ impl MessageStateManager
         let vis_timeout = self.timers.remove(&receipt);
 
         match vis_timeout {
-            Some((vis_timeout, start_time)) => {
+            Some((vis_timeout, _)) => {
                 vis_timeout.end(should_delete);
             }
             None => {
@@ -83,7 +81,6 @@ pub enum MessageStateManagerMessage {
 #[derive(Clone)]
 pub struct MessageStateManagerActor {
     pub sender: Sender<MessageStateManagerMessage>,
-    receiver: Receiver<MessageStateManagerMessage>,
     id: String,
 }
 
@@ -120,7 +117,6 @@ impl MessageStateManagerActor {
 
         MessageStateManagerActor {
             sender: sender,
-            receiver: receiver,
             id: id,
         }
     }
@@ -132,17 +128,13 @@ impl MessageStateManagerActor {
             visibility_timeout,
             start_time
         };
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("MessageStateManagerActor.register : All receivers have died.");
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn deregister(&self, receipt: String, should_delete: bool) {
-        if !should_delete {
-            println!("Error when processing message, apparently!");
-        }
-
         let msg = MessageStateManagerMessage::DeregisterVariant { receipt, should_delete };
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("MessageStateManagerActor.deregister : All receivers have died.");
     }
 }
 
@@ -217,7 +209,7 @@ impl VisibilityTimeoutActor {
             let mut _start_time = None;
 
             loop {
-                if recvr.len() > 5 {
+                if recvr.len() > 50 {
                     println!("VisibilityTimeoutActor queue len {}", recvr.len());
                 }
                 let recvr = recvr.clone();
@@ -344,6 +336,7 @@ impl VisibilityTimeoutExtenderBroker
 // messages into chunks, and send those chunks to the VisibilityTimeoutExtender
 // It will buffer messages for some amount of time, or until it receives 10 messages
 // in an effort to perform bulk API calls
+#[derive(Clone)]
 pub struct VisibilityTimeoutExtenderBuffer
 {
     extender_broker: VisibilityTimeoutExtenderBroker,
@@ -374,21 +367,10 @@ impl VisibilityTimeoutExtenderBuffer
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&mut self, receipt: String, timeout: Duration, start_time: Instant, should_delete: bool) {
         if self.buffer.is_full() {
-            println!("MessageDeleteBuffer buffer full. Flushing.");
             self.flush();
         }
 
         self.buffer.push((receipt, timeout, start_time, should_delete));
-    }
-
-    fn dedup_cache(&mut self) {
-        self.buffer.as_mut().sort();
-        use std::iter::FromIterator;
-        let mut temp_buf = self.buffer.as_ref().to_owned();
-        temp_buf.dedup();
-        if temp_buf.len() < self.buffer.len() {
-            self.buffer = ArrayVec::from_iter(temp_buf.into_iter());
-        }
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
@@ -398,38 +380,8 @@ impl VisibilityTimeoutExtenderBuffer
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
-    pub fn drop_message(&mut self, receipt: String) {
-        if self.buffer.len() == 0 {
-            println!("Race to clear buffer failed");
-            return;
-        }
-        let mut index = Some(0);
-
-        for (i, &(ref r, _, _, _)) in self.buffer.iter().enumerate() {
-            if *r == receipt {
-                index = Some(i);
-                break
-            }
-        }
-
-        let index = match index {
-            Some(index) => {
-                println!("Successfully removed message before race");
-                index
-            }
-            None => {
-                println!("Race to clear buffer failed");
-                return;
-            }
-        };
-
-        self.buffer.swap_remove(index);
-    }
-
-    #[cfg_attr(feature = "flame_it", flame)]
     pub fn on_timeout(&mut self) {
         if self.buffer.len() != 0 {
-            println!("VisibilityTimeoutExtenderBuffer timeout. Flushing {:#?} messages.", self.buffer.len());
             self.flush();
         }
     }
@@ -438,14 +390,12 @@ impl VisibilityTimeoutExtenderBuffer
 pub enum VisibilityTimeoutExtenderBufferMessage {
     Extend { receipt: String, timeout: Duration, start_time: Instant, should_delete: bool },
     Flush {},
-    DropMessage { receipt: String },
     OnTimeout {},
 }
 
 #[derive(Clone)]
 pub struct VisibilityTimeoutExtenderBufferActor {
     sender: Sender<VisibilityTimeoutExtenderBufferMessage>,
-    receiver: Receiver<VisibilityTimeoutExtenderBufferMessage>,
     id: String,
 }
 
@@ -455,34 +405,107 @@ impl VisibilityTimeoutExtenderBufferActor {
                -> VisibilityTimeoutExtenderBufferActor
     {
         let mut actor = actor;
-        let (sender, receiver) = unbounded();
+        let (vis_sender, vis_receiver) = unbounded();
         let id = uuid::Uuid::new_v4().to_string();
-        let recvr = receiver.clone();
+        let vis_recvr = vis_receiver;
+
+        for _ in 0..1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        {
+            let recvr = vis_recvr.clone();
+            let mut actor = actor.clone();
+            thread::spawn(
+                move || {
+                    loop {
+                        if recvr.len() > 50 {
+                            println!("VisibilityTimeoutExtenderBuffer queue len {}", recvr.len());
+                        }
+                        match recvr.recv_timeout(actor.flush_period) {
+                            Ok(msg) => {
+                                actor.route_msg(msg);
+                                continue
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                break
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                actor.route_msg(VisibilityTimeoutExtenderBufferMessage::Flush {});
+                                continue
+                            }
+                        }
+                    }
+                });
+        }
+
+        let mut actor = actor;
+        let (del_sender, del_receiver) = unbounded();
+        let id = uuid::Uuid::new_v4().to_string();
+        let del_recvr = del_receiver;
+
+        for _ in 0..1 {
+            let recvr = del_recvr.clone();
+            let mut actor = actor.clone();
+            thread::spawn(
+                move || {
+                    loop {
+                        if recvr.len() > 50 {
+                            println!("VisibilityTimeoutExtenderBuffer queue len {}", recvr.len());
+                        }
+                        match recvr.recv_timeout(actor.flush_period) {
+                            Ok(msg) => {
+                                actor.route_msg(msg);
+                                continue
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                break
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                actor.route_msg(VisibilityTimeoutExtenderBufferMessage::Flush {});
+                                continue
+                            }
+                        }
+                    }
+                });
+        }
+
+
+        let (sender2, receiver2): (Sender<VisibilityTimeoutExtenderBufferMessage>, _) = unbounded();
+        let recvr2 = receiver2.clone();
+        let mut actor = actor.clone();
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 5 {
-                        println!("VisibilityTimeoutExtenderBuffer queue len {}", recvr.len());
+                    if recvr2.len() > 50 {
+                        println!("VisibilityTimeoutExtenderBufferBroker queue len {}", del_recvr.len());
                     }
-                    match recvr.recv_timeout(actor.flush_period) {
+                    match recvr2.recv_timeout(actor.flush_period) {
                         Ok(msg) => {
-                            actor.route_msg(msg);
-                            continue
+
+                            match msg {
+                                VisibilityTimeoutExtenderBufferMessage::Extend {
+                                    should_delete, ..
+                                }   => {
+                                    if should_delete {
+                                        del_sender.send(msg);
+                                    } else {
+                                        vis_sender.send(msg);
+                                    }
+                                },
+                                msg => actor.route_msg(msg)
+                            }
                         }
                         Err(RecvTimeoutError::Disconnected) => {
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            println!("Haven't received a message in 10 seconds");
+                            actor.route_msg(VisibilityTimeoutExtenderBufferMessage::Flush {});
                             continue
                         }
                     }
                 }
             });
 
+
         VisibilityTimeoutExtenderBufferActor {
-            sender: sender,
-            receiver: receiver,
+            sender: sender2,
             id: id,
         }
     }
@@ -495,25 +518,19 @@ impl VisibilityTimeoutExtenderBufferActor {
             should_delete,
             start_time,
         };
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("VisibilityTimeoutExtenderBufferActor.send: All receivers have died.");
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn flush(&self) {
         let msg = VisibilityTimeoutExtenderBufferMessage::Flush {};
-        self.sender.send(msg).expect("All receivers have died.");
-    }
-
-    #[cfg_attr(feature = "flame_it", flame)]
-    pub fn drop_message(&self, receipt: String) {
-        let msg = VisibilityTimeoutExtenderBufferMessage::DropMessage { receipt };
-        self.sender.send(msg).expect("All receivers have died")
+        self.sender.send(msg).expect("VisibilityTimeoutExtenderBufferActor.flush All receivers have died.");
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn on_timeout(&self) {
         let msg = VisibilityTimeoutExtenderBufferMessage::OnTimeout {};
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("VisibilityTimeoutExtenderBufferActor.on_timeout All receivers have died.");
     }
 }
 
@@ -531,7 +548,6 @@ impl VisibilityTimeoutExtenderBuffer
                 self.extend(receipt, timeout, start_time, should_delete)
             }
             VisibilityTimeoutExtenderBufferMessage::Flush {} => self.flush(),
-            VisibilityTimeoutExtenderBufferMessage::DropMessage { receipt } => self.drop_message(receipt),
             VisibilityTimeoutExtenderBufferMessage::OnTimeout {} => self.on_timeout(),
         };
     }
@@ -578,7 +594,7 @@ impl BufferFlushTimerActor {
 
         thread::spawn(move || {
             loop {
-                if recvr.len() > 5 {
+                if recvr.len() > 50 {
                     println!("BufferFlushTimerActor queue len {}", recvr.len());
                 }
                 let recvr = recvr.clone();
@@ -617,13 +633,13 @@ impl BufferFlushTimerActor {
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn start(&self) {
         let msg = BufferFlushTimerMessage::StartVariant;
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("BufferFlushTimerActor.start: All receivers have died.");
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn end(&self) {
         let msg = BufferFlushTimerMessage::End;
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("BufferFlushTimerActor.end: All receivers have died.");
     }
 }
 
@@ -654,13 +670,16 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
 
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&mut self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
-        let mut id_map = HashMap::with_capacity(10);
+        let mut id_map = HashMap::with_capacity(timeout_info.len());
 
         let mut to_delete = vec![];
         let entries: Vec<_> = timeout_info.into_iter().filter_map(|(receipt, timeout, start_time, should_delete)| {
             let now = Instant::now();
-            if start_time + timeout < now {
+            if start_time + timeout < now + Duration::from_millis(10) {
                 println!("ERROR: MESSAGE TIMEOUT HAS EXPIRED ALREADY: {:#?} {:#?} {:#?}", start_time, timeout, now);
+                if should_delete {
+                    to_delete.push((receipt.clone(), start_time));
+                }
                 return None;
             }
 
@@ -670,12 +689,12 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
             } else {
                 let id = format!("{}", uuid::Uuid::new_v4());
 
-                id_map.insert(id.clone(), receipt.clone());
+                id_map.insert(id.clone(), (receipt.clone(), timeout, start_time));
 
                 Some(ChangeMessageVisibilityBatchRequestEntry {
                     id,
                     receipt_handle: receipt,
-                    visibility_timeout: Some(39600 as i64)
+                    visibility_timeout: Some(timeout.as_secs() as i64)
                 })
             }
         }).collect();
@@ -692,25 +711,24 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
             queue_url: self.queue_url.clone()
         };
 
-        let mut backoff = 5;
+        let mut backoff = 0;
         loop {
             match self.sqs_client.change_message_visibility_batch(&req) {
                 Ok(t) => {
                     if !t.failed.is_empty() {
+                        let mut to_retry = Vec::with_capacity(t.failed.len());
                         for failed in t.failed.clone() {
-                            //                            let _= id_map.get(&failed.id).unwrap();
-                            //                            println!("Failed to change message timeout {:#?}", t.failed)
+                            to_retry.push(id_map.get(&failed.id).unwrap().clone());
                         }
-                    } else {
-                        println!("Successfully changed message visibilities");
+                        self.retry_extend(to_retry, 0);
                     }
-
+                    println!("Successfully updated visibilities for {} messages", t.successful.len());
                     break
                 }
                 Err(e) => {
-                    thread::sleep(Duration::from_secs(2));
                     backoff += 1;
-                    if backoff > 3 {
+                    thread::sleep(Duration::from_secs(20 * backoff));
+                    if backoff > 5 {
                         println!("Failed to change message visibility {}", e);
                         break
                     } else {
@@ -723,6 +741,70 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
         for (receipt, init_time) in to_delete.into_iter() {
             self.deleter.delete_message(receipt, init_time);
         }
+    }
+
+    fn retry_extend(&mut self, timeout_info: Vec<(String, Duration, Instant)>, attempts: usize) {
+        if attempts > 10 {
+            println!("Failed to retry_extend {} messages", timeout_info.len());
+            return
+        }
+
+        let mut id_map = HashMap::with_capacity(timeout_info.len());
+
+        let entries: Vec<_> = timeout_info.into_iter().flat_map(|(receipt, timeout, start_time)| {
+            let now = Instant::now();
+            if start_time + timeout < now + Duration::from_millis(10) {
+                println!("ERROR: MESSAGE TIMEOUT HAS EXPIRED ALREADY: {:#?} {:#?} {:#?}", start_time, timeout, now);
+                None
+            } else {
+                let id = format!("{}", uuid::Uuid::new_v4());
+                id_map.insert(id.clone(), (receipt.clone(), timeout, start_time));
+
+                Some(ChangeMessageVisibilityBatchRequestEntry {
+                    id,
+                    receipt_handle: receipt,
+                    visibility_timeout: Some(timeout.as_secs() as i64)
+                })
+            }
+
+        }).collect();
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let req = ChangeMessageVisibilityBatchRequest {
+            entries,
+            queue_url: self.queue_url.clone()
+        };
+
+        let mut backoff = 0;
+        loop {
+            match self.sqs_client.change_message_visibility_batch(&req) {
+                Ok(t) => {
+                    if !t.failed.is_empty() {
+                        let mut to_retry = Vec::with_capacity(t.failed.len());
+                        for failed in t.failed.clone() {
+                            to_retry.push(id_map.get(&failed.id).unwrap().clone());
+                        }
+                        thread::sleep(Duration::from_millis(5 * attempts as u64 + 1));
+                        self.retry_extend(to_retry, attempts + 1);
+                    }
+                    break
+                }
+                Err(e) => {
+                    backoff += 1;
+                    thread::sleep(Duration::from_millis(5 * backoff));
+                    if backoff > 5 {
+                        println!("Failed to change message visibility {}", e);
+                        break
+                    } else {
+                        continue
+                    }
+                }
+            };
+        }
+
     }
 }
 
@@ -773,7 +855,7 @@ impl VisibilityTimeoutExtenderActor {
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            println!("Haven't received a message in 10 seconds");
+
                         }
                     }
                 }
@@ -805,7 +887,7 @@ impl VisibilityTimeoutExtenderActor {
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            println!("Haven't received a message in 10 seconds");
+
                         }
                     }
                 }
@@ -821,7 +903,7 @@ impl VisibilityTimeoutExtenderActor {
     #[cfg_attr(feature = "flame_it", flame)]
     pub fn extend(&self, timeout_info: Vec<(String, Duration, Instant, bool)>) {
         let msg = VisibilityTimeoutExtenderMessage::ExtendVariant { timeout_info };
-        self.sender.send(msg).expect("All receivers have died.");
+        self.sender.send(msg).expect("VisibilityTimeoutExtenderActor.extend: All receivers have died.");
     }
 }
 
@@ -862,14 +944,31 @@ mod test {
     use flame;
     use std::fs::File;
     use uuid::Uuid;
+    use std::sync::{Arc, Mutex};
 
-    struct MockSqs {}
+    struct MockSqs {
+        pub receives: Arc<Mutex<usize>>,
+        pub deletes: Arc<Mutex<usize>>
+    }
 
-    struct MockSns {}
+    struct MockSns {
+        pub publishes: Arc<Mutex<usize>>
+    }
 
     impl Sqs for MockSqs {
         fn receive_message(&self, input: &rusoto_sqs::ReceiveMessageRequest) -> Result<rusoto_sqs::ReceiveMessageResult, rusoto_sqs::ReceiveMessageError> {
-            thread::sleep(Duration::from_millis(1));
+//            thread::sleep(Duration::from_millis(25));
+
+            let rc = self.receives.clone();
+
+            if *rc.lock().unwrap() >= 100_000 {
+                thread::sleep(Duration::from_secs(20));
+                return Ok(rusoto_sqs::ReceiveMessageResult {
+                    messages: None
+                })
+            }
+
+            *rc.lock().unwrap() += 10;
 
             let mut messages = vec![];
             for _ in 0..10 {
@@ -907,7 +1006,7 @@ mod test {
         fn change_message_visibility(&self,
                                      input: &rusoto_sqs::ChangeMessageVisibilityRequest)
                                      -> Result<(), rusoto_sqs::ChangeMessageVisibilityError> {
-            thread::sleep(Duration::from_millis(10));
+//            thread::sleep(Duration::from_millis(10));
             Ok(())
         }
 
@@ -944,7 +1043,8 @@ mod test {
         fn delete_message_batch(&self,
                                 input: &rusoto_sqs::DeleteMessageBatchRequest)
                                 -> Result<rusoto_sqs::DeleteMessageBatchResult, rusoto_sqs::DeleteMessageBatchError> {
-            thread::sleep(Duration::from_millis(10));
+            *self.deletes.lock().unwrap() += 10;
+            println!("Deletes {}", *self.deletes.lock().unwrap());
             Ok(
                 rusoto_sqs::DeleteMessageBatchResult {
                     failed: vec![],
@@ -1174,7 +1274,10 @@ mod test {
 
 
         fn publish(&self, input: &PublishInput) -> Result<PublishResponse, PublishError> {
-            thread::sleep(Duration::from_millis(15));
+            let rc = self.publishes.clone();
+
+            *rc.lock().unwrap() += 1;
+
             Ok(PublishResponse {
                 message_id: Some("id".to_owned())
             })
@@ -1248,7 +1351,8 @@ mod test {
     use util;
     use util::TopicCreator;
     use xorshift::{self, Rng};
-    #[test]
+
+//    #[test]
     fn test_happy() {
         util::set_timer();
         let timer = util::get_timer();
@@ -1268,7 +1372,7 @@ mod test {
             |_| {
                 MessageDeleter::new(sqs_client.clone(), queue_url.clone(), throttler.clone())
             },
-            350,
+            550,
             None
         );
 
@@ -1278,7 +1382,6 @@ mod test {
         let delete_flusher = DeleteBufferFlusher::new(deleter.clone(), Duration::from_secs(1));
         DeleteBufferFlusherActor::new(delete_flusher.clone());
 
-        let sqs_client = Arc::new(new_sqs_client(&provider));
         let sns_client = Arc::new(new_sns_client(&provider));
 
         let broker = VisibilityTimeoutExtenderBroker::new(
@@ -1306,17 +1409,16 @@ mod test {
                 let publisher = MessagePublisher::new(sns_client.clone(), state_manager.clone());
                 DelayMessageProcessor::new(publisher, TopicCreator::new(sns_client.clone()))
             },
-            10,
-            None,
+            100,
+            1000,
             state_manager.clone()
         );
 
-        let sqs_client = Arc::new(new_sqs_client(&provider));
         let sqs_broker = DelayMessageConsumerBroker::new(
             |actor| {
                 DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone(), throttler.clone())
             },
-            1,
+            100,
             None
         );
 
@@ -1332,17 +1434,45 @@ mod test {
         let first = workers.next().unwrap();
         first.consume();
 
-        thread::sleep(Duration::from_secs(2));
+    //        thread::sleep(Duration::from_secs(2));
+
+        time!({
         for worker in workers {
             worker.consume();
-            worker.throttle(Duration::from_millis(rng.gen_range(150,1500)))
         }
+
+        loop {
+            let mut count = *sqs_client.deletes.lock().unwrap();
+
+            if count < 100_000 {
+
+            } else {
+                *sqs_client.deletes.lock().unwrap() = 0;
+                break
+            }
+        }
+        }, "completed");
+
+        time!({
+        loop {
+            let count = *sqs_client.deletes.lock().unwrap();
+
+            if count < 100_000 {
+
+            } else {
+                break
+            }
+        }
+    }, "completed");
         println!("consumers started");
 
         //        thread::sleep(Duration::from_secs(10));
         //        println!("Writing stats to disk");
-        ////        flame::dump_html(&mut File::create("flame-graph.html").unwrap()).unwrap();
+//        flame::dump_html(&mut File::create("flame-graph.html").unwrap()).unwrap();
         //        thread::sleep(Duration::from_secs(120));
+
+
+        thread::sleep(Duration::from_secs(5));
         loop {
             thread::park()
         }
@@ -1351,12 +1481,17 @@ mod test {
     fn new_sqs_client<P>(sqs_provider: &P) -> MockSqs
         where P: ProvideAwsCredentials + Clone + Send + 'static
     {
-        MockSqs {}
+        MockSqs {
+            receives: Arc::new(Mutex::new(0)),
+            deletes: Arc::new(Mutex::new(0))
+        }
     }
 
     fn new_sns_client<P>(sns_provider: &P) -> MockSns
         where P: ProvideAwsCredentials + Clone + Send + 'static
     {
-        MockSns {}
+        MockSns {
+            publishes: Arc::new(Mutex::new(0))
+        }
     }
 }

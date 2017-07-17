@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 //#![deny(warnings)]
-#![feature(conservative_impl_trait, drop_types_in_const)]
+#![feature(conservative_impl_trait, drop_types_in_const, sort_unstable, test)]
 #![cfg_attr(feature = "flame_it", feature(plugin, custom_attribute))]
 #![cfg_attr(feature = "flame_it", plugin(flamer))]
+
+extern crate test;
 
 #[cfg(feature = "flame_it")]
 extern crate flame;
@@ -17,6 +19,7 @@ extern crate slog_term;
 extern crate serde_derive;
 
 extern crate base64;
+extern crate coco;
 extern crate xorshift;
 extern crate dogstatsd;
 extern crate env_logger;
@@ -37,6 +40,7 @@ extern crate itertools;
 extern crate serde;
 extern crate serde_json;
 extern crate lru_time_cache;
+extern crate parking_lot;
 extern crate stopwatch;
 extern crate slog_json;
 extern crate uuid;
@@ -96,6 +100,7 @@ mod publish;
 mod processor;
 mod consumer;
 mod autoscaling;
+mod queue;
 
 use autoscaling::*;
 use processor::*;
@@ -116,7 +121,7 @@ use util::*;
 use std::time::Duration;
 use xorshift::Rng;
 
-const PROCESSOR_COUNT: usize = 10;
+const PROCESSOR_COUNT: usize = 100;
 const CONSUMER_COUNT: usize = 10;
 
 
@@ -187,16 +192,12 @@ fn main() {
         |_| {
             VisibilityTimeoutExtender::new(sqs_client.clone(), queue_url.clone(), deleter.clone())
         },
-        550,
+        650,
         None
     );
 
-    let buffer = VisibilityTimeoutExtenderBuffer::new(broker, 2);
+    let buffer = VisibilityTimeoutExtenderBuffer::new(broker, 1);
     let buffer = VisibilityTimeoutExtenderBufferActor::new(buffer);
-
-    let flusher = BufferFlushTimer::new(buffer.clone(), Duration::from_millis(200));
-    let flusher = BufferFlushTimerActor::new(flusher);
-    std::mem::forget(flusher);
 
     let state_manager = MessageStateManager::new(buffer, deleter.clone());
     let state_manager = MessageStateManagerActor::new(state_manager);
@@ -207,7 +208,7 @@ fn main() {
             DelayMessageProcessor::new(publisher, TopicCreator::new(sns_client.clone()))
         },
         PROCESSOR_COUNT,
-        None,
+        750,
         state_manager.clone()
     );
 
@@ -217,7 +218,7 @@ fn main() {
             |actor| {
                 DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone(), throttler.clone())
             },
-        10,
+        1,
         None
     );
 

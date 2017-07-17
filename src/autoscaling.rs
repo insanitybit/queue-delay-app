@@ -151,51 +151,64 @@ pub struct ThrottlerActor
 pub struct Throttler {
     throttler: Option<ConsumerThrottlerActor>,
     inflight_timings: LruCache<String, Instant>,
-    proc_times: ArrayDeque<[u32; 1024]>,
+    proc_times: StreamingMedian,
     inflight_limit: usize,
 }
 
 impl Throttler {
     pub fn new() -> Throttler {
         let inflight_timings = LruCache::with_expiry_duration(Duration::from_secs(12 * 60 * 60));
-        let proc_times = ArrayDeque::from_iter(iter::repeat(50));
+        let proc_times = StreamingMedian::new();
         Throttler {
             throttler: None,
             inflight_timings,
             proc_times,
-            inflight_limit: 0,
+            inflight_limit: 10,
         }
     }
 
     pub fn message_start(&mut self, receipt: String, time_started: Instant) {
-        println!("Registering: {}", receipt.clone());
         if let Some(_) = self.inflight_timings.insert(receipt, time_started.clone()) {
             println!("Error, message starting twice");
         }
 
+        let processing_time = self.proc_times.last() as u64;
+
         // If we have more inflight messages than our limit...
-            // Get the number of messages over the limit
-            let backlog = self.inflight_timings.len() - self.inflight_limit;
-            // Calculate the average time it takes to process and delete messages
-            let processing_time = millis(self.get_average_ms());
-            // Throttle for the average processing time for each message
-            let timeout = processing_time + 1 * backlog as u64;
-        println!("{} messages above threshold of {}. Throttling consumers for {}ms. Proctime: {}ms", backlog, self.inflight_limit, timeout, processing_time);
-        if self.inflight_timings.len() > self.inflight_limit * 10 {
-            self.throttler.as_ref().unwrap().throttle(Duration::from_millis(timeout * 20));
-            self.throttler.as_ref().unwrap().throttle(Duration::from_millis(timeout * 2));
-            self.throttler.as_ref().unwrap().throttle(Duration::from_millis(timeout));
-        } else if self.inflight_timings.len() > self.inflight_limit * 2 {
-            self.throttler.as_ref().unwrap().throttle(Duration::from_millis(timeout * 2));
-            self.throttler.as_ref().unwrap().throttle(Duration::from_millis(timeout));
-        } else if self.inflight_timings.len() > self.inflight_limit {
-            self.throttler.as_ref().unwrap().throttle(Duration::from_millis(timeout));
+        if self.inflight_timings.len() > self.inflight_limit {
+            if self.inflight_timings.len() > self.inflight_limit * 10 {
+                for _ in 0..50 {
+                    self.throttler.as_ref().unwrap().drop_consumer();
+                }
+            } else if self.inflight_timings.len() > self.inflight_limit * 2 {
+                self.throttler.as_ref().unwrap().drop_consumer();
+                self.throttler.as_ref().unwrap().throttle(
+                    Duration::from_millis(self.inflight_timings.len() as u64 * processing_time));
+            } else {
+                self.throttler.as_ref().unwrap().throttle(
+                    Duration::from_millis(self.inflight_timings.len() as u64 * processing_time));
+            }
+        } else if self.inflight_timings.len() as f64 > self.inflight_limit as f64 * 0.95 {
+            self.throttler.as_ref().unwrap().drop_consumer();
+            self.throttler.as_ref().unwrap().throttle(
+                Duration::from_millis(processing_time)
+            );
+        } else if self.inflight_timings.len() as f64 > self.inflight_limit as f64 * 0.85 {
+            self.throttler.as_ref().unwrap().throttle(
+                Duration::from_millis(processing_time)
+            );
+        } else if (self.inflight_timings.len() as f64) > self.inflight_limit as f64 * 0.55 {
+            self.throttler.as_ref().unwrap().add_consumer();
+            self.throttler.as_ref().unwrap().throttle(
+                Duration::from_millis(processing_time)
+            );
+        } else {
+            self.throttler.as_ref().unwrap().add_consumer();
+            self.throttler.as_ref().unwrap().add_consumer();
+            self.throttler.as_ref().unwrap().throttle(
+                Duration::from_millis(processing_time / 2)
+            );
         }
-
-
-//            else if self.inflight_timings.len() > self.inflight_limit * 80 / 100 {
-//
-//        }
     }
 
     pub fn message_stop(&mut self, receipt: String, time_stopped: Instant, success: bool) {
@@ -209,18 +222,20 @@ impl Throttler {
                 // Calculate the time it took from message consumption to delete
                 let proc_time = millis(time_stopped - start_time) as u32;
 
-                self.proc_times.pop_front();
-                self.proc_times.push_back(proc_time);
                 println!("proc_time {}", proc_time);
+                self.proc_times.insert(proc_time);
+                let median = self.proc_times.current();
                 // Recalculate the maximum backlog based on our most recent processing times
-                let new_max = self.get_max_backlog(Duration::from_secs(28));
+                let new_max = self.get_max_backlog(Duration::from_secs(28), median);
                 self.inflight_limit = if new_max == 0 {
                     println!("inflight limit {}", self.inflight_limit);
-                    self.inflight_limit + 10
+                    self.inflight_limit + 1
                 } else {
                     println!("inflight limit {}", new_max);
                     new_max as usize
                 };
+
+                self.inflight_limit = min(self.inflight_limit, 120_000);
             }
             _ => {
                 println!("Attempting to deregister timeout that does not exist:\
@@ -235,9 +250,8 @@ impl Throttler {
 
     // Given a timeout of n seconds, and our current processing times,
     // what is the number of messages we can process within that timeout
-    fn get_max_backlog(&self, dur: Duration) -> u64 {
-        let max_ms = millis(dur);
-        let proc_time = millis(self.get_average_ms());
+    fn get_max_backlog(&self, dur: Duration, proc_time: u32) -> u64 {
+        let max_ms = millis(dur) as u32;
 
         if proc_time == 0 {
             return 0;
@@ -245,22 +259,7 @@ impl Throttler {
 
         let max_msgs = max_ms / proc_time;
 
-        max(max_msgs, 10) as u64
-    }
-
-    fn get_average_ms(&self) -> Duration {
-        if self.proc_times.is_empty() {
-            Duration::from_millis(80)
-        } else {
-            let mut avg = 0;
-
-            for time in &self.proc_times {
-                avg += *time;
-            }
-            avg /= self.proc_times.len() as u32;
-
-            Duration::from_millis(avg as u64)
-        }
+        max(max_msgs, 1) as u64
     }
 
     fn route_msg(&mut self, msg: ThrottlerMessage) {
@@ -289,7 +288,6 @@ impl ThrottlerActor
         thread::spawn(
             move || {
                 loop {
-                    println!("backlog: {}", recvr.len());
                     match recvr.recv_timeout(Duration::from_secs(30)) {
                         Ok(msg) => {
                             actor.route_msg(msg);
@@ -316,7 +314,7 @@ impl ThrottlerActor
         self.sender.send(ThrottlerMessage::MessageStart {
             receipt,
             time_started
-        });
+        }).expect("ThrottlerActor.message_start: receivers have died.");
     }
 
     pub fn message_stop(&self, receipt: String, time_stopped: Instant, success: bool) {
@@ -324,10 +322,50 @@ impl ThrottlerActor
             receipt,
             time_stopped,
             success
-        });
+        }).expect("ThrottlerActor.message_stop: receivers have died.");
     }
 
     pub fn register_consumer_throttler(&self, consumer_throttler: ConsumerThrottlerActor) {
-        self.sender.send(ThrottlerMessage::RegisterConsumerThrottler { throttler: consumer_throttler });
+        self.sender.send(ThrottlerMessage::RegisterConsumerThrottler { throttler: consumer_throttler })
+            .expect("ThrottlerActor.register_consumer_throttler: receivers have died.");
+    }
+}
+
+pub struct StreamingMedian {
+    data: ArrayDeque<[u32; 64]>,
+    last_median: u32,
+}
+
+impl StreamingMedian {
+    pub fn new() -> StreamingMedian {
+        StreamingMedian {
+            data: ArrayDeque::from_iter(iter::repeat(31_000)),
+            last_median: 31_000,
+        }
+    }
+
+    pub fn last(&self) -> u32 {
+        self.last_median
+    }
+
+    pub fn insert(&mut self, value: u32) {
+        self.data.pop_front();
+        self.data.push_back(value);
+    }
+
+    pub fn current(&mut self) -> u32 {
+        let mut sorted: Vec<_> = self.data.iter().collect();
+        sorted.sort_unstable();
+        let median = if sorted.len() % 2 == 0 {
+            let index = sorted.len() / 2 - 1;
+            let med1 = sorted[index];
+            let med2 = sorted[index + 1];
+            (med1 + med2) / 2
+        } else {
+            *sorted[sorted.len() / 2]
+        };
+
+        self.last_median = median;
+        median
     }
 }

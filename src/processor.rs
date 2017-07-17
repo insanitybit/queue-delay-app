@@ -211,43 +211,44 @@ impl<SN> MessageHandler for DelayMessageProcessor<SN>
 {
     #[cfg_attr(feature = "flame_it", flame)]
     fn process_message(&mut self, msg: SqsMessage) -> Result<(), String> {
-        let receipt = match msg.receipt_handle.clone() {
-            Some(receipt) => receipt,
-            None => {
-                return Err("No receipt found for message in process_message".to_owned());
-            }
-        };
-
-        let raw_body = match msg.body {
-            Some(ref body) => body.to_owned(),
-            None => {
-                println!("Message has no body.");
-
-                return Err("Message has no body.".to_owned());
-            }
-        };
-
-        let body = decode(&raw_body);
-
-        let body = match body {
-            Ok(body) => body,
-            Err(e) => {
-                return Err(format!("Body was not base64 encoded: {}", e));
-            }
-        };
-
-        let delay_message: Result<DelayMessage, _> = serde_json::from_slice(&body[..]);
-
-        let delay_message = match delay_message {
-            Ok(m) => m,
-            Err(e) => {
-                return Err(format!("Failed to deserialize delay message: {}", e));
-            }
-        };
-
-        let arn = self.topic_creator.get_or_create(delay_message.topic_name.clone())?;
-
-
-        self.publisher.publish(delay_message.message, arn.get())
+//        let receipt = match msg.receipt_handle.clone() {
+//            Some(receipt) => receipt,
+//            None => {
+//                return Err("No receipt found for message in process_message".to_owned());
+//            }
+//        };
+//
+//        let raw_body = match msg.body {
+//            Some(ref body) => body.to_owned(),
+//            None => {
+//                println!("Message has no body.");
+//
+//                return Err("Message has no body.".to_owned());
+//            }
+//        };
+//
+//        let body = decode(&raw_body);
+//
+//        let body = match body {
+//            Ok(body) => body,
+//            Err(e) => {
+//                return Err(format!("Body was not base64 encoded: {}", e));
+//            }
+//        };
+//
+//        let delay_message: Result<DelayMessage, _> = serde_json::from_slice(&body[..]);
+//
+//        let delay_message = match delay_message {
+//            Ok(m) => m,
+//            Err(e) => {
+//                return Err(format!("Failed to deserialize delay message: {}", e));
+//            }
+//        };
+//
+//        let arn = self.topic_creator.get_or_create(delay_message.topic_name.clone())?;
+//
+//
+//        self.publisher.publish(delay_message.message, arn.get())
+        Ok(())
     }
 }

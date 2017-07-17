@@ -8,7 +8,7 @@ use slog_scope;
 use visibility::*;
 use autoscaling::*;
 use uuid;
-
+use util::*;
 use processor::*;
 
 use two_lock_queue::{Sender, Receiver, RecvTimeoutError, unbounded, channel};
@@ -24,7 +24,8 @@ pub struct DelayMessageConsumer<SQ>
     actor: DelayMessageConsumerActor,
     vis_manager: MessageStateManagerActor,
     processor: DelayMessageProcessorBroker,
-    throttler: ThrottlerActor
+    throttler: ThrottlerActor,
+    throttle: Duration
 }
 
 impl<SQ> DelayMessageConsumer<SQ>
@@ -47,7 +48,8 @@ impl<SQ> DelayMessageConsumer<SQ>
             actor,
             vis_manager,
             processor,
-            throttler
+            throttler,
+            throttle: Duration::from_millis(500)
         }
     }
 
@@ -60,6 +62,7 @@ impl<SQ> DelayMessageConsumer<SQ>
             ..Default::default()
         };
 
+        let now = Instant::now();
         // If we receive a network error we'll sleep for a few ms and retry
         let messages = match self.sqs_client.receive_message(&msg_request) {
             Ok(res) => {
@@ -70,6 +73,8 @@ impl<SQ> DelayMessageConsumer<SQ>
                 return;
             }
         };
+
+        let dur = Instant::now() - now;
 
         if let Some(mut messages) = messages {
             let o_len = messages.len();
@@ -96,13 +101,17 @@ impl<SQ> DelayMessageConsumer<SQ>
             for message in messages {
                 self.processor.process(message.clone());
             }
-
+            if dur < self.throttle {
+                thread::sleep(self.throttle - dur);
+            }
         }
     }
 
-    pub fn throttle(&self, how_long: Duration)
+    pub fn throttle(&mut self, how_long: Duration)
     {
-        thread::sleep(how_long);
+        println!("sleeping: {:#?}", millis(how_long));
+        self.throttle = how_long;
+//        thread::sleep(how_long);
     }
 
     fn route_msg(&mut self, msg: DelayMessageConsumerMessage) {
@@ -249,13 +258,13 @@ impl DelayMessageConsumerActor
 
     #[cfg_attr(feature="flame_it", flame)]
     pub fn consume(&self) {
-        let _ = self.sender.send(DelayMessageConsumerMessage::Consume)
+        self.sender.send(DelayMessageConsumerMessage::Consume)
             .expect("Underlying consumer has died");
     }
 
     #[cfg_attr(feature="flame_it", flame)]
     pub fn throttle(&self, how_long: Duration) {
-        let _ = self.p_sender.send(DelayMessageConsumerMessage::Throttle {how_long})
+        self.p_sender.send(DelayMessageConsumerMessage::Throttle {how_long})
             .expect("Underlying consumer has died");
     }
 }
@@ -269,6 +278,7 @@ pub struct DelayMessageConsumerBroker
     pub worker_count: usize,
     sender: Sender<DelayMessageConsumerMessage>,
     p_sender: Sender<DelayMessageConsumerMessage>,
+    new: DelayMessageConsumerActor,
     id: String
 }
 
@@ -298,10 +308,28 @@ impl DelayMessageConsumerBroker
         DelayMessageConsumerBroker {
             workers,
             worker_count,
-            sender,
-            p_sender,
+            sender: sender.clone(),
+            p_sender: p_sender.clone(),
+            new: DelayMessageConsumerActor::from_queue(&new, sender.clone(), receiver.clone(),
+                                                       p_sender.clone(), p_receiver.clone()),
             id
         }
+    }
+
+    pub fn add_consumer(&mut self) {
+        if self.worker_count < 50 {
+            self.workers.push(self.new.clone());
+            self.worker_count += 1;
+        }
+        println!("Adding consumer: {}", self.worker_count);
+    }
+
+    pub fn drop_consumer(&mut self) {
+        if self.worker_count > 1 {
+            self.workers.pop();
+            self.worker_count -= 1;
+        }
+        println!("Dropping consumer: {}", self.worker_count);
     }
 
     #[cfg_attr(feature="flame_it", flame)]
@@ -325,7 +353,7 @@ pub struct ConsumerThrottler {
     consumer_broker: Option<DelayMessageConsumerBroker>,
 }
 
-impl ConsumerThrottler{
+impl ConsumerThrottler {
     pub fn new()
     -> ConsumerThrottler {
         ConsumerThrottler {
@@ -348,10 +376,20 @@ impl ConsumerThrottler{
         self.consumer_broker = Some(consumer);
     }
 
+    pub fn drop_consumer(&mut self) {
+        self.consumer_broker.as_mut().unwrap().drop_consumer()
+    }
+
+    pub fn add_consumer(&mut self) {
+        self.consumer_broker.as_mut().unwrap().add_consumer()
+    }
+
     fn route_msg(&mut self, msg: ConsumerThrottlerMessage) {
         match msg {
             ConsumerThrottlerMessage::Throttle {how_long} => self.throttle(how_long),
             ConsumerThrottlerMessage::RegisterconsumerBroker {consumer} => self.register_consumer(consumer),
+            ConsumerThrottlerMessage::DropConsumer => self.drop_consumer(),
+            ConsumerThrottlerMessage::AddConsumer => self.add_consumer(),
         }
     }
 }
@@ -359,7 +397,9 @@ impl ConsumerThrottler{
 pub enum ConsumerThrottlerMessage
 {
     Throttle {how_long: Duration},
-    RegisterconsumerBroker {consumer: DelayMessageConsumerBroker}
+    RegisterconsumerBroker {consumer: DelayMessageConsumerBroker},
+    DropConsumer,
+    AddConsumer,
 }
 
 #[derive(Clone)]
@@ -417,11 +457,22 @@ impl ConsumerThrottlerActor
     }
 
     pub fn register_consumer(&self, consumer: DelayMessageConsumerBroker) {
-        self.sender.send(ConsumerThrottlerMessage::RegisterconsumerBroker {consumer});
+        self.sender.send(ConsumerThrottlerMessage::RegisterconsumerBroker {consumer})
+            .expect("ConsumerThrottlerActor.register_consumer receivers have died");
     }
 
     pub fn throttle(&self, how_long: Duration) {
-        let _ = self.p_sender.send(ConsumerThrottlerMessage::Throttle {how_long})
+        self.p_sender.send(ConsumerThrottlerMessage::Throttle {how_long})
+            .expect("Underlying consumer has died");
+    }
+
+    pub fn add_consumer(&self) {
+        self.p_sender.send(ConsumerThrottlerMessage::AddConsumer)
+            .expect("Underlying consumer has died");
+    }
+
+    pub fn drop_consumer(&self) {
+        self.p_sender.send(ConsumerThrottlerMessage::DropConsumer)
             .expect("Underlying consumer has died");
     }
 }
