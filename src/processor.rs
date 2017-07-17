@@ -47,13 +47,13 @@ pub struct DelayMessageProcessorActor {
 
 impl DelayMessageProcessorActor {
     #[cfg_attr(feature = "flame_it", flame)]
-    pub fn from_queue<SN, F>(new: &F,
+    pub fn from_queue<P, F>(new: &F,
                              sender: Sender<SqsMessage>,
                              receiver: Receiver<SqsMessage>,
                              state_manager: MessageStateManagerActor)
                              -> DelayMessageProcessorActor
-        where SN: Sns + Send + Sync + 'static,
-              F: Fn(DelayMessageProcessorActor) -> DelayMessageProcessor<SN>
+        where P: MessageHandler + Send + 'static,
+              F: Fn(DelayMessageProcessorActor) -> P
     {
         let id = Uuid::new_v4().to_string();
 
@@ -105,10 +105,10 @@ impl DelayMessageProcessorActor {
     }
 
     #[cfg_attr(feature = "flame_it", flame)]
-    pub fn new<SN, F>(new: F, state_manager: MessageStateManagerActor)
+    pub fn new<P, F>(new: F, state_manager: MessageStateManagerActor)
                       -> DelayMessageProcessorActor
-        where SN: Sns + Send + Sync + 'static,
-              F: FnOnce(DelayMessageProcessorActor) -> DelayMessageProcessor<SN>
+        where P: MessageHandler + Send + 'static,
+              F: FnOnce(DelayMessageProcessorActor) -> P
     {
         let (sender, receiver) = channel(100);
         let id = Uuid::new_v4().to_string();
@@ -125,9 +125,6 @@ impl DelayMessageProcessorActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 10 {
-                        println!("DelayMessageProcessorActor queue len {}", recvr.len());
-                    }
 
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
@@ -173,14 +170,14 @@ pub struct DelayMessageProcessorBroker
 impl DelayMessageProcessorBroker
 {
     #[cfg_attr(feature = "flame_it", flame)]
-    pub fn new<T, F, SN>(new: F,
+    pub fn new<P, T, F>(new: F,
                          worker_count: usize,
                          max_queue_depth: T,
                          state_manager: MessageStateManagerActor)
                          -> DelayMessageProcessorBroker
-        where F: Fn(DelayMessageProcessorActor) -> DelayMessageProcessor<SN>,
+        where P: MessageHandler + Send + 'static,
+              F: Fn(DelayMessageProcessorActor) -> P,
               T: Into<Option<usize>>,
-              SN: Sns + Send + Sync + 'static,
     {
         let id = Uuid::new_v4().to_string();
 

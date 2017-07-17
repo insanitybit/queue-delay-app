@@ -5,7 +5,7 @@ use util::*;
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use rusoto_sqs::{Sqs, DeleteMessageBatchRequest, DeleteMessageBatchRequestEntry};
-
+use slog_scope;
 use std::sync::Arc;
 use arrayvec::ArrayVec;
 use std::iter::Iterator;
@@ -55,7 +55,7 @@ impl<SQ> MessageDeleter<SQ>
         }
         }).collect();
 
-        println!("Deleting {} messages", msg_count);
+        debug!(slog_scope::logger(), "Deleting {} messages", msg_count);
 
         let req = DeleteMessageBatchRequest {
             entries,
@@ -72,13 +72,13 @@ impl<SQ> MessageDeleter<SQ>
                         let dur = now - *init_time;
 
                         let dur = millis(dur);
-                        println!("Took {}ms to process message to deletion", dur)
+                        debug!(slog_scope::logger(), "Took {}ms to process message to deletion", dur)
                     }
                     break
                 },
                 Err(e)  => {
                     if backoff >= 5 {
-                        println!("Failed to deleted {} messages {}", msg_count ,e);
+                        warn!(slog_scope::logger(), "Failed to deleted {} messages {}", msg_count ,e);
                         break
                     }
                     backoff += 1;
@@ -125,9 +125,6 @@ impl MessageDeleterActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 10 {
-                        println!("MessageDeleterActor queue len {}", recvr.len());
-                    }
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             actor.route_msg(msg);
@@ -173,9 +170,6 @@ impl MessageDeleterActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 10 {
-                        println!("MessageDeleterActor queue len {}", recvr.len());
-                    }
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             _actor.route_msg(msg);
@@ -315,9 +309,6 @@ impl MessageDeleteBufferActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 10 {
-                        println!("MessageDeleteBufferActor queue len {}", recvr.len());
-                    }
                     match recvr.recv_timeout(actor.flush_period) {
                         Ok(msg) => {
                             actor.route_msg(msg);
@@ -423,9 +414,6 @@ impl DeleteBufferFlusherActor {
         let recvr = receiver.clone();
         thread::spawn(move || {
             loop {
-                if recvr.len() > 10 {
-                    println!("DeleteBufferFlusherActor queue len {}", recvr.len())
-                }
                 let recvr = recvr.clone();
                 let actor = actor.clone();
                 let dur = actor.period; // Default, minimal timeout
@@ -444,7 +432,6 @@ impl DeleteBufferFlusherActor {
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         actor.buffer.on_timeout();
-                        println!("Disconnected");
                         break
                     }
                 }

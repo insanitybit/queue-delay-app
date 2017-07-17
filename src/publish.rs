@@ -5,7 +5,7 @@ use uuid;
 use std::time::{Duration};
 use rusoto_sns::{Sns, PublishInput};
 use delay::DelayMessage;
-
+use slog_scope;
 use std::sync::Arc;
 use std::iter::Iterator;
 use std::thread;
@@ -36,7 +36,7 @@ impl<SN> MessagePublisher<SN>
                 self.vis_manager.deregister(receipt.clone(), true);
             },
             Err(e)  => {
-                println!("Failed to publish message with: {}", e);
+                warn!(slog_scope::logger(), "Failed to publish message with: {}", e);
                 self.vis_manager.deregister(receipt, false);
             }
         }

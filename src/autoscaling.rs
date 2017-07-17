@@ -10,6 +10,7 @@ use std::thread;
 
 use consumer::*;
 use util::*;
+use slog_scope;
 
 type CurrentActors = usize;
 
@@ -169,7 +170,7 @@ impl Throttler {
 
     pub fn message_start(&mut self, receipt: String, time_started: Instant) {
         if let Some(_) = self.inflight_timings.insert(receipt, time_started.clone()) {
-            println!("Error, message starting twice");
+            error!(slog_scope::logger(), "Message starting twice");
         }
 
         let processing_time = self.proc_times.last() as u64;
@@ -222,23 +223,26 @@ impl Throttler {
                 // Calculate the time it took from message consumption to delete
                 let proc_time = millis(time_stopped - start_time) as u32;
 
-                println!("proc_time {}", proc_time);
                 self.proc_times.insert(proc_time);
                 let median = self.proc_times.current();
+                let last_limit = self.inflight_limit;
                 // Recalculate the maximum backlog based on our most recent processing times
                 let new_max = self.get_max_backlog(Duration::from_secs(28), median);
                 self.inflight_limit = if new_max == 0 {
-                    println!("inflight limit {}", self.inflight_limit);
                     self.inflight_limit + 1
                 } else {
-                    println!("inflight limit {}", new_max);
                     new_max as usize
                 };
+
+                if last_limit != self.inflight_limit {
+                    debug!(slog_scope::logger(),
+                           "Setting new inflight limit to : {} from {}", self.inflight_limit, last_limit);
+                }
 
                 self.inflight_limit = min(self.inflight_limit, 120_000);
             }
             _ => {
-                println!("Attempting to deregister timeout that does not exist:\
+                warn!(slog_scope::logger(), "Attempting to deregister timeout that does not exist:\
                 receipt: {} success: {}", receipt, success);
             }
         };

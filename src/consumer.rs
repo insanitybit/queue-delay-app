@@ -82,7 +82,7 @@ impl<SQ> DelayMessageConsumer<SQ>
             messages.dedup_by(|a, b| a.receipt_handle == b.receipt_handle);
 
             if o_len != messages.len() {
-                println!("Contained duplicate messages!");
+                warn!(slog_scope::logger(), "Contained duplicate messages!");
             }
 
             let messages: Vec<_> = messages.iter().filter_map(|msg| {
@@ -97,7 +97,7 @@ impl<SQ> DelayMessageConsumer<SQ>
                 }
             }).collect();
 
-            println!("Processing {} messages", messages.len());
+            trace!(slog_scope::logger(), "Processing {} messages", messages.len());
             for message in messages {
                 self.processor.process(message.clone());
             }
@@ -109,9 +109,7 @@ impl<SQ> DelayMessageConsumer<SQ>
 
     pub fn throttle(&mut self, how_long: Duration)
     {
-        println!("sleeping: {:#?}", millis(how_long));
         self.throttle = how_long;
-//        thread::sleep(how_long);
     }
 
     fn route_msg(&mut self, msg: DelayMessageConsumerMessage) {
@@ -192,7 +190,6 @@ impl DelayMessageConsumerActor
                             continue
                         }
                         Err(RecvTimeoutError::Disconnected) => {
-                            println!("Consumer disconnected");
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
@@ -243,7 +240,6 @@ impl DelayMessageConsumerActor
                             continue
                         }
                         Err(RecvTimeoutError::Disconnected) => {
-                            println!("Consumer disconnected");
                             break
                         }
                         Err(RecvTimeoutError::Timeout) => {
@@ -321,7 +317,7 @@ impl DelayMessageConsumerBroker
             self.workers.push(self.new.clone());
             self.worker_count += 1;
         }
-        println!("Adding consumer: {}", self.worker_count);
+        debug!(slog_scope::logger(), "Adding consumer: {}", self.worker_count);
     }
 
     pub fn drop_consumer(&mut self) {
@@ -329,7 +325,7 @@ impl DelayMessageConsumerBroker
             self.workers.pop();
             self.worker_count -= 1;
         }
-        println!("Dropping consumer: {}", self.worker_count);
+        debug!(slog_scope::logger(), "Dropping consumer: {}", self.worker_count);
     }
 
     #[cfg_attr(feature="flame_it", flame)]
@@ -368,7 +364,7 @@ impl ConsumerThrottler {
                     consumer_broker.throttle(how_long)
                 }
             },
-            None    => println!("Error - no consumer registered with ConsumerThrottler")
+            None    => error!(slog_scope::logger(), "No consumer registered with ConsumerThrottler")
         }
     }
 

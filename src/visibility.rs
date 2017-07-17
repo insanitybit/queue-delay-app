@@ -13,11 +13,11 @@ use arrayvec::ArrayVec;
 use std::iter::Iterator;
 use std::thread;
 use delete::*;
-use consumer::{self, ConsumerThrottlerActor};
+use slog_scope;
+use consumer::ConsumerThrottlerActor;
 
 use lru_time_cache::LruCache;
 use std::cmp::{min, max};
-use std::iter::FromIterator;
 
 /// The MessageStateManager manages the local message's state in the SQS service. That is, it will
 /// handle maintaining the messages visibility, and it will handle deleting the message
@@ -62,7 +62,7 @@ impl MessageStateManager
                 vis_timeout.end(should_delete);
             }
             None => {
-                println!("Attempting to deregister timeout that does not exist:\
+                warn!(slog_scope::logger(), "Attempting to deregister timeout that does not exist:\
                 receipt: {} should_delete: {}", receipt, should_delete);
             }
         };
@@ -97,9 +97,6 @@ impl MessageStateManagerActor {
         thread::spawn(
             move || {
                 loop {
-                    //                    if recvr.len() > 5 {
-                    ////                        println!("VisibilityTimeoutManagerActor queue len {}", recvr.len());
-                    //                    }
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             actor.route_msg(msg);
@@ -209,14 +206,10 @@ impl VisibilityTimeoutActor {
             let mut _start_time = None;
 
             loop {
-                if recvr.len() > 50 {
-                    println!("VisibilityTimeoutActor queue len {}", recvr.len());
-                }
                 let recvr = recvr.clone();
                 let actor = actor.clone();
                 let receipt = actor.receipt.clone();
                 let res = recvr.recv_timeout(dur / 2);
-
 
                 match res {
                     Ok(msg) => {
@@ -237,7 +230,7 @@ impl VisibilityTimeoutActor {
                                         actor.buf.extend(receipt.clone(), dur, st.clone(), should_delete);
                                     }
                                     None => {
-                                        println!("Error, no start time provided")
+                                        error!(slog_scope::logger(), "Error, no start time provided")
                                     }
                                 }
                                 return;
@@ -255,7 +248,7 @@ impl VisibilityTimeoutActor {
                                 actor.buf.extend(receipt.clone(), dur, st.clone(), false);
                             }
                             None => {
-                                println!("Error, no start time provided")
+                                error!(slog_scope::logger(), "No start time provided")
                             }
                         }
                     }
@@ -415,9 +408,6 @@ impl VisibilityTimeoutExtenderBufferActor {
             thread::spawn(
                 move || {
                     loop {
-                        if recvr.len() > 50 {
-                            println!("VisibilityTimeoutExtenderBuffer queue len {}", recvr.len());
-                        }
                         match recvr.recv_timeout(actor.flush_period) {
                             Ok(msg) => {
                                 actor.route_msg(msg);
@@ -446,9 +436,6 @@ impl VisibilityTimeoutExtenderBufferActor {
             thread::spawn(
                 move || {
                     loop {
-                        if recvr.len() > 50 {
-                            println!("VisibilityTimeoutExtenderBuffer queue len {}", recvr.len());
-                        }
                         match recvr.recv_timeout(actor.flush_period) {
                             Ok(msg) => {
                                 actor.route_msg(msg);
@@ -473,9 +460,6 @@ impl VisibilityTimeoutExtenderBufferActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr2.len() > 50 {
-                        println!("VisibilityTimeoutExtenderBufferBroker queue len {}", del_recvr.len());
-                    }
                     match recvr2.recv_timeout(actor.flush_period) {
                         Ok(msg) => {
 
@@ -594,9 +578,6 @@ impl BufferFlushTimerActor {
 
         thread::spawn(move || {
             loop {
-                if recvr.len() > 50 {
-                    println!("BufferFlushTimerActor queue len {}", recvr.len());
-                }
                 let recvr = recvr.clone();
                 let actor = actor.clone();
                 let dur = actor.period; // Default, minimal timeout
@@ -676,7 +657,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
         let entries: Vec<_> = timeout_info.into_iter().filter_map(|(receipt, timeout, start_time, should_delete)| {
             let now = Instant::now();
             if start_time + timeout < now + Duration::from_millis(10) {
-                println!("ERROR: MESSAGE TIMEOUT HAS EXPIRED ALREADY: {:#?} {:#?} {:#?}", start_time, timeout, now);
+                error!(slog_scope::logger(), "Message timeout expired before extend: start_time {:#?} timeout {:#?} now {:#?}", start_time, timeout, now);
                 if should_delete {
                     to_delete.push((receipt.clone(), start_time));
                 }
@@ -722,14 +703,14 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
                         }
                         self.retry_extend(to_retry, 0);
                     }
-                    println!("Successfully updated visibilities for {} messages", t.successful.len());
+                    trace!(slog_scope::logger(), "Successfully updated visibilities for {} messages", t.successful.len());
                     break
                 }
                 Err(e) => {
                     backoff += 1;
                     thread::sleep(Duration::from_secs(20 * backoff));
                     if backoff > 5 {
-                        println!("Failed to change message visibility {}", e);
+                        warn!(slog_scope::logger(), "Failed to change message visibility {}", e);
                         break
                     } else {
                         continue
@@ -745,7 +726,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
 
     fn retry_extend(&mut self, timeout_info: Vec<(String, Duration, Instant)>, attempts: usize) {
         if attempts > 10 {
-            println!("Failed to retry_extend {} messages", timeout_info.len());
+            warn!(slog_scope::logger(), "Failed to retry_extend {} messages", timeout_info.len());
             return
         }
 
@@ -754,7 +735,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
         let entries: Vec<_> = timeout_info.into_iter().flat_map(|(receipt, timeout, start_time)| {
             let now = Instant::now();
             if start_time + timeout < now + Duration::from_millis(10) {
-                println!("ERROR: MESSAGE TIMEOUT HAS EXPIRED ALREADY: {:#?} {:#?} {:#?}", start_time, timeout, now);
+                error!(slog_scope::logger(), "Message timeout expired before extend: start_time {:#?} timeout {:#?} now {:#?}", start_time, timeout, now);
                 None
             } else {
                 let id = format!("{}", uuid::Uuid::new_v4());
@@ -796,7 +777,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
                     backoff += 1;
                     thread::sleep(Duration::from_millis(5 * backoff));
                     if backoff > 5 {
-                        println!("Failed to change message visibility {}", e);
+                        warn!(slog_scope::logger(), "Failed to change message visibility {}", e);
                         break
                     } else {
                         continue
@@ -844,9 +825,6 @@ impl VisibilityTimeoutExtenderActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 5 {
-                        println!("VisibilityTimeoutExtenderActor queue len {}", recvr.len());
-                    }
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             _actor.route_msg(msg);
@@ -876,9 +854,6 @@ impl VisibilityTimeoutExtenderActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 5 {
-                        println!("VisibilityTimeoutExtenderActor queue len {}", recvr.len());
-                    }
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             actor.route_msg(msg);
@@ -946,9 +921,11 @@ mod test {
     use uuid::Uuid;
     use std::sync::{Arc, Mutex};
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     struct MockSqs {
-        pub receives: Arc<Mutex<usize>>,
-        pub deletes: Arc<Mutex<usize>>
+        pub receives: Arc<AtomicUsize>,
+        pub deletes: Arc<AtomicUsize>
     }
 
     struct MockSns {
@@ -959,16 +936,16 @@ mod test {
         fn receive_message(&self, input: &rusoto_sqs::ReceiveMessageRequest) -> Result<rusoto_sqs::ReceiveMessageResult, rusoto_sqs::ReceiveMessageError> {
 //            thread::sleep(Duration::from_millis(25));
 
-            let rc = self.receives.clone();
+            let mut rc = self.receives.clone();
 
-            if *rc.lock().unwrap() >= 100_000 {
+            if rc.load(Ordering::Relaxed) >= 100_000 {
                 thread::sleep(Duration::from_secs(20));
                 return Ok(rusoto_sqs::ReceiveMessageResult {
                     messages: None
                 })
             }
 
-            *rc.lock().unwrap() += 10;
+            rc.fetch_add(10, Ordering::Relaxed);
 
             let mut messages = vec![];
             for _ in 0..10 {
@@ -1043,8 +1020,7 @@ mod test {
         fn delete_message_batch(&self,
                                 input: &rusoto_sqs::DeleteMessageBatchRequest)
                                 -> Result<rusoto_sqs::DeleteMessageBatchResult, rusoto_sqs::DeleteMessageBatchError> {
-            *self.deletes.lock().unwrap() += 10;
-            println!("Deletes {}", *self.deletes.lock().unwrap());
+            self.deletes.fetch_add(10, Ordering::Relaxed);
             Ok(
                 rusoto_sqs::DeleteMessageBatchResult {
                     failed: vec![],
@@ -1352,10 +1328,36 @@ mod test {
     use util::TopicCreator;
     use xorshift::{self, Rng};
 
-//    #[test]
+    #[test]
     fn test_happy() {
         util::set_timer();
         let timer = util::get_timer();
+
+        let log_path = "test_everything.log";
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .expect(&format!("Failed to create log file {}", log_path));
+
+        // create logger
+        let logger = slog::Logger::root(
+            Mutex::new(slog_json::Json::default(file)).map(slog::Fuse),
+            o!("version" => env!("CARGO_PKG_VERSION"),
+           "place" =>
+              FnValue(move |info| {
+                  format!("{}:{} {}",
+                          info.file(),
+                          info.line(),
+                          info.module())
+              }))
+        );
+
+        // slog_stdlog uses the logger from slog_scope, so set a logger there
+        let _guard = slog_scope::set_global_logger(logger);
+
+
         let provider = util::get_profile_provider();
         let queue_name = "local-dev-cobrien-TEST_QUEUE";
         let queue_url = "some queue url".to_owned();
@@ -1442,12 +1444,12 @@ mod test {
         }
 
         loop {
-            let mut count = *sqs_client.deletes.lock().unwrap();
+            let count = sqs_client.deletes.load(Ordering::Relaxed);
 
             if count < 100_000 {
 
             } else {
-                *sqs_client.deletes.lock().unwrap() = 0;
+                let count = sqs_client.deletes.store(0, Ordering::Relaxed);
                 break
             }
         }
@@ -1455,7 +1457,7 @@ mod test {
 
         time!({
         loop {
-            let count = *sqs_client.deletes.lock().unwrap();
+            let count = sqs_client.deletes.load(Ordering::Relaxed);
 
             if count < 100_000 {
 
@@ -1482,8 +1484,8 @@ mod test {
         where P: ProvideAwsCredentials + Clone + Send + 'static
     {
         MockSqs {
-            receives: Arc::new(Mutex::new(0)),
-            deletes: Arc::new(Mutex::new(0))
+            receives: Arc::new(AtomicUsize::new(0)),
+            deletes: Arc::new(AtomicUsize::new(0))
         }
     }
 
