@@ -1,13 +1,11 @@
 use visibility::*;
 use publish::*;
-use base64::decode;
-use serde_json;
 
 use rusoto_sqs::Message as SqsMessage;
 use two_lock_queue::{Sender, Receiver, RecvTimeoutError, unbounded, channel};
 use std::time::Duration;
 use rusoto_sns::Sns;
-use delay::DelayMessage;
+use slog_scope;
 use util::TopicCreator;
 use uuid::Uuid;
 use std::thread;
@@ -69,16 +67,12 @@ impl DelayMessageProcessorActor {
         thread::spawn(
             move || {
                 loop {
-                    if recvr.len() > 10 {
-                        println!("DelayMessageProcessorActorx queue len {}", recvr.len());
-                    }
-
                     match recvr.recv_timeout(Duration::from_secs(60)) {
                         Ok(msg) => {
                             let receipt = match msg.receipt_handle.clone() {
                                 Some(r) => r,
                                 None => {
-                                    println!("Missing receipt handle");
+                                    error!(slog_scope::logger(), "Missing receipt handle");
                                     continue
                                 }
                             };
@@ -131,7 +125,7 @@ impl DelayMessageProcessorActor {
                             let receipt = match msg.receipt_handle.clone() {
                                 Some(r) => r,
                                 None => {
-                                    println!("Missing receipt handle");
+                                    error!(slog_scope::logger(), "Missing receipt handle");
                                     continue
                                 }
                             };
