@@ -371,27 +371,6 @@ impl StreamingMedian {
         self.last_median
     }
 
-    pub fn insert(&mut self, value: u32) {
-        self.data.pop_front();
-        self.data.push_back(value);
-    }
-
-    pub fn current(&mut self) -> u32 {
-        let mut sorted: [u32; 63] = unsafe {uninitialized()};
-
-        for (i, t) in self.data.iter().enumerate() {
-            unsafe {
-                *sorted.get_unchecked_mut(i) = *t;
-            }
-        }
-
-        sorted.sort_unstable();
-
-        let median = unsafe {*sorted.get_unchecked(31)};
-        self.last_median = median;
-        median
-    }
-
     pub fn insert_and_calculate(&mut self, value: u32) -> u32 {
         let mut scratch_space: [u32; 63] = unsafe {uninitialized()};
 
@@ -490,26 +469,48 @@ mod test {
     use xorshift::{Xoroshiro128, Rng, SeedableRng};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-//    #[test]
-    fn test_median() {
-        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
-        let mut rng = Xoroshiro128::from_seed(&[71, 1223, t]);
-
-        let mut median_tracker = StreamingMedian::new();
-        for _ in 0..100_000 {
-            median_tracker.insert(rng.gen());
-            median_tracker.current();
-        }
-    }
-
     #[test]
-    fn test_median2() {
+    fn test_median_random() {
         let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
         let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
 
         let mut median_tracker = StreamingMedian::new();
-        for _ in 0..1_000_000 {
+        for _ in 0..100_000 {
             median_tracker.insert_and_calculate(rng.gen());
+        }
+
+        for i in median_tracker.sorted.windows(2) {
+            assert!(i[0] < i[1]);
+        }
+    }
+
+    #[test]
+    fn test_median_ascending() {
+        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
+
+        let mut median_tracker = StreamingMedian::new();
+
+        let mut ascending_iter = (0..);
+        for _ in 0..100_000 {
+            median_tracker.insert_and_calculate(ascending_iter.next().unwrap());
+        }
+
+        for i in median_tracker.sorted.windows(2) {
+            assert!(i[0] < i[1]);
+        }
+    }
+
+    #[test]
+    fn test_median_descending() {
+        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
+
+        let mut median_tracker = StreamingMedian::new();
+
+        let mut ascending_iter = (200_000..);
+        for _ in 0..100_000 {
+            median_tracker.insert_and_calculate(ascending_iter.next().unwrap());
         }
 
         for i in median_tracker.sorted.windows(2) {
@@ -527,52 +528,11 @@ mod bench {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[bench]
-    fn bench_insert(b: &mut Bencher) {
-        let mut median_tracker = StreamingMedian::new();
-
-        b.iter(|| {
-            median_tracker.insert(100);
-        });
-    }
-
-    #[bench]
-    fn bench_calculate(b: &mut Bencher) {
-        let mut median_tracker = StreamingMedian::new();
-
-        b.iter(|| {
-            median_tracker.current();
-        });
-    }
-
-    #[bench]
-    fn bench_insert_calculate(b: &mut Bencher) {
-        let mut median_tracker = StreamingMedian::new();
-
-        b.iter(|| {
-            median_tracker.insert(100);
-            median_tracker.current();
-        });
-    }
-
-    #[bench]
     fn bench_insert_and_calculate(b: &mut Bencher) {
         let mut median_tracker = StreamingMedian::new();
 
         b.iter(|| {
             median_tracker.insert_and_calculate(100);
-        });
-    }
-
-    #[bench]
-    fn bench_insert_calculate_rand(b: &mut Bencher) {
-        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
-        let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
-
-        let mut median_tracker = StreamingMedian::new();
-
-        b.iter(|| {
-            median_tracker.insert(rng.gen());
-            median_tracker.current();
         });
     }
 
