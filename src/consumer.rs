@@ -23,7 +23,7 @@ pub struct DelayMessageConsumer<SQ>
     metrics: Arc<Client>,
     actor: DelayMessageConsumerActor,
     vis_manager: MessageStateManagerActor,
-    processor: DelayMessageProcessorBroker,
+    processor: MessageHandlerBroker,
     throttler: ThrottlerActor,
     throttle: Duration
 }
@@ -37,7 +37,7 @@ impl<SQ> DelayMessageConsumer<SQ>
                metrics: Arc<Client>,
                actor: DelayMessageConsumerActor,
                vis_manager: MessageStateManagerActor,
-               processor: DelayMessageProcessorBroker,
+               processor: MessageHandlerBroker,
                throttler: ThrottlerActor)
                -> DelayMessageConsumer<SQ>
     {
@@ -116,6 +116,10 @@ impl<SQ> DelayMessageConsumer<SQ>
         match msg {
             DelayMessageConsumerMessage::Consume  => self.consume(),
             DelayMessageConsumerMessage::Throttle {how_long}    => self.throttle(how_long),
+            DelayMessageConsumerMessage::ShutDown => {
+                self.shut_down();
+                return
+            },
         };
 
         self.actor.consume();
@@ -134,12 +138,17 @@ impl<SQ> DelayMessageConsumer<SQ>
             }
         }
     }
+
+    fn shut_down(&mut self) {
+
+    }
 }
 
 pub enum DelayMessageConsumerMessage
 {
     Consume,
     Throttle {how_long: Duration},
+    ShutDown
 }
 
 #[derive(Clone)]
@@ -263,6 +272,10 @@ impl DelayMessageConsumerActor
         self.p_sender.send(DelayMessageConsumerMessage::Throttle {how_long})
             .expect("Underlying consumer has died");
     }
+
+    pub fn shut_down(self) {
+        let _ = self.p_sender.send(DelayMessageConsumerMessage::ShutDown);
+    }
 }
 
 
@@ -326,6 +339,11 @@ impl DelayMessageConsumerBroker
             self.worker_count -= 1;
         }
         debug!(slog_scope::logger(), "Dropping consumer: {}", self.worker_count);
+    }
+
+    pub fn shut_down(&mut self) {
+        self.workers.clear();
+        self.worker_count == 0;
     }
 
     #[cfg_attr(feature="flame_it", flame)]

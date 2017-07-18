@@ -179,36 +179,38 @@ impl Throttler {
         if self.inflight_timings.len() > self.inflight_limit {
             if self.inflight_timings.len() > self.inflight_limit * 10 {
                 for _ in 0..50 {
-                    self.throttler.as_ref().unwrap().drop_consumer();
+                    self.throttler.as_ref().map(|t| t.drop_consumer());
                 }
             } else if self.inflight_timings.len() > self.inflight_limit * 2 {
-                self.throttler.as_ref().unwrap().drop_consumer();
-                self.throttler.as_ref().unwrap().throttle(
-                    Duration::from_millis(self.inflight_timings.len() as u64 * processing_time));
+                self.throttler.as_ref().map(|t| t.drop_consumer());
+                self.throttler.as_ref().map(|t| t.throttle(
+                    Duration::from_millis(self.inflight_timings.len() as u64 * processing_time)
+                ));
             } else {
-                self.throttler.as_ref().unwrap().throttle(
-                    Duration::from_millis(self.inflight_timings.len() as u64 * processing_time));
+                self.throttler.as_ref().map(|t| t.throttle(
+                    Duration::from_millis(self.inflight_timings.len() as u64 * processing_time)
+                ));
             }
         } else if self.inflight_timings.len() as f64 > self.inflight_limit as f64 * 0.95 {
-            self.throttler.as_ref().unwrap().drop_consumer();
-            self.throttler.as_ref().unwrap().throttle(
+            self.throttler.as_ref().map(|t| t.drop_consumer());
+            self.throttler.as_ref().map(|t| t.throttle(
                 Duration::from_millis(processing_time)
-            );
+            ));
         } else if self.inflight_timings.len() as f64 > self.inflight_limit as f64 * 0.85 {
-            self.throttler.as_ref().unwrap().throttle(
+            self.throttler.as_ref().map(|t| t.throttle(
                 Duration::from_millis(processing_time)
-            );
+            ));
         } else if (self.inflight_timings.len() as f64) > self.inflight_limit as f64 * 0.55 {
-            self.throttler.as_ref().unwrap().add_consumer();
-            self.throttler.as_ref().unwrap().throttle(
+            self.throttler.as_ref().map(|t| t.add_consumer());
+            self.throttler.as_ref().map(|t| t.throttle(
                 Duration::from_millis(processing_time)
-            );
+            ));
         } else {
-            self.throttler.as_ref().unwrap().add_consumer();
-            self.throttler.as_ref().unwrap().add_consumer();
-            self.throttler.as_ref().unwrap().throttle(
+            self.throttler.as_ref().map(|t| t.add_consumer());
+            self.throttler.as_ref().map(|t| t.add_consumer());
+            self.throttler.as_ref().map(|t| t.throttle(
                 Duration::from_millis(processing_time / 2)
-            );
+            ));
         }
     }
 
@@ -219,12 +221,11 @@ impl Throttler {
         match start_time {
             // We are only interested in timings for successfully processed messages, at least
             // in part because this is likely the slowest path and we want to throttle accordingly
-            Some(start_time) => {
+            Some(start_time) if success => {
                 // Calculate the time it took from message consumption to delete
                 let proc_time = millis(time_stopped - start_time) as u32;
 
-                self.proc_times.insert(proc_time);
-                let median = self.proc_times.current();
+                let median = self.proc_times.insert_and_calculate(proc_time);
                 let last_limit = self.inflight_limit;
                 // Recalculate the maximum backlog based on our most recent processing times
                 let new_max = self.get_max_backlog(Duration::from_secs(28), median);
@@ -273,6 +274,10 @@ impl Throttler {
                 self.message_stop(receipt, time_stopped, success),
             ThrottlerMessage::RegisterConsumerThrottler { throttler } => self.register_consumer_throttler(throttler)
         }
+    }
+
+    pub fn get_inflight_limit(&self) -> usize {
+        self.inflight_limit
     }
 }
 
@@ -337,13 +342,27 @@ impl ThrottlerActor
 
 pub struct StreamingMedian {
     data: ArrayDeque<[u32; 64]>,
+    sorted: [u32; 63],
     last_median: u32,
 }
 
+use std::mem::uninitialized;
+use arrayvec::ArrayVec;
+
 impl StreamingMedian {
     pub fn new() -> StreamingMedian {
+        let data = ArrayDeque::from_iter(iter::repeat(31_000).take(64));
+        let mut sorted: [u32; 63] = unsafe {uninitialized()};
+
+        for (i, t) in data.iter().enumerate() {
+            unsafe {
+                *sorted.get_unchecked_mut(i) = *t;
+            }
+        }
+
         StreamingMedian {
-            data: ArrayDeque::from_iter(iter::repeat(31_000)),
+            data,
+            sorted,
             last_median: 31_000,
         }
     }
@@ -358,18 +377,146 @@ impl StreamingMedian {
     }
 
     pub fn current(&mut self) -> u32 {
-        let mut sorted: Vec<_> = self.data.iter().collect();
-        sorted.sort_unstable();
-        let median = if sorted.len() % 2 == 0 {
-            let index = sorted.len() / 2 - 1;
-            let med1 = sorted[index];
-            let med2 = sorted[index + 1];
-            (med1 + med2) / 2
-        } else {
-            *sorted[sorted.len() / 2]
-        };
+        let mut sorted: [u32; 63] = unsafe {uninitialized()};
 
+        for (i, t) in self.data.iter().enumerate() {
+            unsafe {
+                *sorted.get_unchecked_mut(i) = *t;
+            }
+        }
+
+        sorted.sort_unstable();
+
+        let median = unsafe {*sorted.get_unchecked(31)};
         self.last_median = median;
         median
+    }
+
+    pub fn insert_and_calculate(&mut self, value: u32) -> u32 {
+        let mut scratch_space: [u32; 64] = unsafe {uninitialized()};
+
+        let removed = match self.data.pop_front() {
+            Some(t) => t,
+            None    => unsafe {uninitialized()}
+        };
+        self.data.push_back(value);
+
+        let remove_index = self.sorted.binary_search(&removed).unwrap();
+
+        let insert_index = match self.sorted.binary_search(&value) {
+            Ok(t) => t,
+            Err(t) => t,
+        };
+
+        // shift the data between remove_index and insert_index so that the
+        // value of remove_index is overwritten and the 'value' can be placed
+        // in the gap between them
+
+        if remove_index < insert_index {
+            // Starting with a self.sorted of
+            // [2, 3, 4, 5, 7, 8]
+            // insert_and_calculate(6)
+            // [2, 3, 4, 5, 7, 8] <- remove_index = 1, insert_index = 3
+            // [2, 4, 5, 5, 7, 8]
+            // [2, 4, 5, 6, 7, 8]
+
+            unsafe {
+                scratch_space.get_unchecked_mut(remove_index + 1..insert_index).copy_from_slice(&self.sorted.get_unchecked(remove_index + 1..insert_index));
+                self.sorted.get_unchecked_mut(remove_index..insert_index - 1).copy_from_slice(&scratch_space.get_unchecked(remove_index + 1..insert_index));
+                *self.sorted.get_unchecked_mut(insert_index - 1) = value;
+            }
+        } else {
+            // Starting with a self.sorted of
+            // [2, 3, 4, 5, 7, 8, 9]
+            // insert_and_calculate(6)
+            // [2, 3, 4, 5, 7, 8, 9] <- remove_index = 5, insert_index = 3
+            // [2, 3, 4, 5, 5, 7, 9] Shift values
+            // [2, 3, 4, 6, 7, 8, 9] Insert value
+            unsafe {
+                scratch_space.get_unchecked_mut(insert_index..remove_index).copy_from_slice(&self.sorted.get_unchecked(insert_index..remove_index));
+                self.sorted.get_unchecked_mut(insert_index + 1..remove_index + 1).copy_from_slice(&scratch_space.get_unchecked(insert_index..remove_index));
+                *self.sorted.get_unchecked_mut(insert_index) = value;
+            }
+        }
+
+        let median = unsafe {*self.sorted.get_unchecked(31)};
+        self.last_median = median;
+        median
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use xorshift::{Xoroshiro128, Rng, SeedableRng};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+//    #[test]
+    fn test_median() {
+        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let mut rng = Xoroshiro128::from_seed(&[71, 1223, t]);
+
+        let mut median_tracker = StreamingMedian::new();
+        for _ in 0..100_000 {
+            median_tracker.insert(rng.gen());
+            median_tracker.current();
+        }
+    }
+
+    #[test]
+    fn test_median2() {
+        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
+
+        let mut median_tracker = StreamingMedian::new();
+        for _ in 0..1_000_000 {
+            median_tracker.insert_and_calculate(rng.gen());
+        }
+
+        for i in median_tracker.sorted.windows(2) {
+            assert!(i[0] < i[1]);
+        }
+    }
+}
+
+mod bench {
+    use super::*;
+    use test::Bencher;
+
+    #[bench]
+    fn bench_insert(b: &mut Bencher) {
+        let mut median_tracker = StreamingMedian::new();
+
+        b.iter(|| {
+            median_tracker.insert(100);
+        });
+    }
+
+    #[bench]
+    fn bench_calculate(b: &mut Bencher) {
+        let mut median_tracker = StreamingMedian::new();
+
+        b.iter(|| {
+            median_tracker.current();
+        });
+    }
+
+    #[bench]
+    fn bench_insert_calculate(b: &mut Bencher) {
+        let mut median_tracker = StreamingMedian::new();
+
+        b.iter(|| {
+            median_tracker.insert(100);
+            median_tracker.current();
+        });
+    }
+
+    #[bench]
+    fn bench_insert_and_calculate(b: &mut Bencher) {
+        let mut median_tracker = StreamingMedian::new();
+
+        b.iter(|| {
+            median_tracker.insert_and_calculate(100);
+        });
     }
 }

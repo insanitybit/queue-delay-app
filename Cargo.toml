@@ -6,7 +6,7 @@ authors = ["insanitybit <insanitybit@gmail.com>"]
 
 [dependencies]
 rand = "*"
-arraydeque = "*"
+arraydeque = {version = "*", features=["use_union"]}
 coco = "*"
 double = "0.1.3"
 dogstatsd = "0.3.0"

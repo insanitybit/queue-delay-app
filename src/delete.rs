@@ -41,7 +41,6 @@ impl<SQ> MessageDeleter<SQ>
             return
         }
 
-
         let mut receipt_init_map = HashMap::with_capacity(receipts.len());
 
         for (receipt, time) in receipts {
@@ -59,7 +58,7 @@ impl<SQ> MessageDeleter<SQ>
 
         let req = DeleteMessageBatchRequest {
             entries,
-            queue_url: self.queue_url.clone()
+            queue_url: self.queue_url.to_owned()
         };
 
         let mut backoff = 0;
@@ -86,7 +85,7 @@ impl<SQ> MessageDeleter<SQ>
             }
         }
 
-        for receipt in receipt_init_map.keys().cloned() {
+        for receipt in receipt_init_map.drain().map(|(k, _)| k) {
             self.throttler.message_stop(receipt, Instant::now(), true)
         }
 

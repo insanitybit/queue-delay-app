@@ -149,7 +149,7 @@ impl<SN> TopicCreator<SN>
         }
     }
 
-    pub fn get_or_create(&mut self, topic_name: String) -> Result<Topic, String> {
+    pub fn get_or_create(&mut self, topic_name: &str) -> Result<Topic, String> {
         let entry = self.topic_cache.entry(topic_name.to_owned());
 
         match entry {
@@ -180,5 +180,13 @@ impl<SN> TopicCreator<SN>
             }
         }
     }
+}
+
+use processor::{MessageHandlerActor, MessageHandler};
+
+pub fn easy_init<F, P>()
+    where P: MessageHandler,
+          F: Fn(MessageHandlerActor) -> P,
+{
 
 }

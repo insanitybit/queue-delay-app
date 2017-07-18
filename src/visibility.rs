@@ -402,7 +402,7 @@ impl VisibilityTimeoutExtenderBufferActor {
         let id = uuid::Uuid::new_v4().to_string();
         let vis_recvr = vis_receiver;
 
-        for _ in 0..1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        {
+        for _ in 0..1 {
             let recvr = vis_recvr.clone();
             let mut actor = actor.clone();
             thread::spawn(
@@ -462,17 +462,16 @@ impl VisibilityTimeoutExtenderBufferActor {
                 loop {
                     match recvr2.recv_timeout(actor.flush_period) {
                         Ok(msg) => {
-
                             match msg {
                                 VisibilityTimeoutExtenderBufferMessage::Extend {
                                     should_delete, ..
-                                }   => {
+                                } => {
                                     if should_delete {
                                         del_sender.send(msg);
                                     } else {
                                         vis_sender.send(msg);
                                     }
-                                },
+                                }
                                 msg => actor.route_msg(msg)
                             }
                         }
@@ -727,7 +726,7 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
     fn retry_extend(&mut self, timeout_info: Vec<(String, Duration, Instant)>, attempts: usize) {
         if attempts > 10 {
             warn!(slog_scope::logger(), "Failed to retry_extend {} messages", timeout_info.len());
-            return
+            return;
         }
 
         let mut id_map = HashMap::with_capacity(timeout_info.len());
@@ -747,7 +746,6 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
                     visibility_timeout: Some(timeout.as_secs() as i64)
                 })
             }
-
         }).collect();
 
         if entries.is_empty() {
@@ -785,7 +783,6 @@ impl<SQ> VisibilityTimeoutExtender<SQ>
                 }
             };
         }
-
     }
 }
 
@@ -832,9 +829,7 @@ impl VisibilityTimeoutExtenderActor {
                         Err(RecvTimeoutError::Disconnected) => {
                             break
                         }
-                        Err(RecvTimeoutError::Timeout) => {
-
-                        }
+                        Err(RecvTimeoutError::Timeout) => {}
                     }
                 }
             });
@@ -861,9 +856,7 @@ impl VisibilityTimeoutExtenderActor {
                         Err(RecvTimeoutError::Disconnected) => {
                             break
                         }
-                        Err(RecvTimeoutError::Timeout) => {
-
-                        }
+                        Err(RecvTimeoutError::Timeout) => {}
                     }
                 }
             });
@@ -929,20 +922,20 @@ mod test {
     }
 
     struct MockSns {
-        pub publishes: Arc<Mutex<usize>>
+        pub publishes: Arc<AtomicUsize>
     }
 
     impl Sqs for MockSqs {
         fn receive_message(&self, input: &rusoto_sqs::ReceiveMessageRequest) -> Result<rusoto_sqs::ReceiveMessageResult, rusoto_sqs::ReceiveMessageError> {
-//            thread::sleep(Duration::from_millis(25));
+            //            thread::sleep(Duration::from_millis(25));
 
             let mut rc = self.receives.clone();
 
-            if rc.load(Ordering::Relaxed) >= 100_000 {
+            if rc.load(Ordering::Relaxed) >= 1_000 {
                 thread::sleep(Duration::from_secs(20));
                 return Ok(rusoto_sqs::ReceiveMessageResult {
                     messages: None
-                })
+                });
             }
 
             rc.fetch_add(10, Ordering::Relaxed);
@@ -983,7 +976,7 @@ mod test {
         fn change_message_visibility(&self,
                                      input: &rusoto_sqs::ChangeMessageVisibilityRequest)
                                      -> Result<(), rusoto_sqs::ChangeMessageVisibilityError> {
-//            thread::sleep(Duration::from_millis(10));
+            //            thread::sleep(Duration::from_millis(10));
             Ok(())
         }
 
@@ -1020,7 +1013,8 @@ mod test {
         fn delete_message_batch(&self,
                                 input: &rusoto_sqs::DeleteMessageBatchRequest)
                                 -> Result<rusoto_sqs::DeleteMessageBatchResult, rusoto_sqs::DeleteMessageBatchError> {
-            self.deletes.fetch_add(10, Ordering::Relaxed);
+            let msg_count = input.entries.len();
+            self.deletes.fetch_add(msg_count, Ordering::Relaxed);
             Ok(
                 rusoto_sqs::DeleteMessageBatchResult {
                     failed: vec![],
@@ -1250,9 +1244,9 @@ mod test {
 
 
         fn publish(&self, input: &PublishInput) -> Result<PublishResponse, PublishError> {
-            let rc = self.publishes.clone();
+            let mut rc = self.publishes.clone();
 
-            *rc.lock().unwrap() += 1;
+            rc.fetch_add(1, Ordering::Relaxed);
 
             Ok(PublishResponse {
                 message_id: Some("id".to_owned())
@@ -1329,7 +1323,7 @@ mod test {
     use xorshift::{self, Rng};
 
     #[test]
-    fn test_happy() {
+    fn test_thousand() {
         util::set_timer();
         let timer = util::get_timer();
 
@@ -1406,7 +1400,7 @@ mod test {
         let state_manager = MessageStateManager::new(buffer, deleter.clone());
         let state_manager = MessageStateManagerActor::new(state_manager);
 
-        let processor = DelayMessageProcessorBroker::new(
+        let processor = MessageHandlerBroker::new(
             |_| {
                 let publisher = MessagePublisher::new(sns_client.clone(), state_manager.clone());
                 DelayMessageProcessor::new(publisher, TopicCreator::new(sns_client.clone()))
@@ -1416,7 +1410,7 @@ mod test {
             state_manager.clone()
         );
 
-        let sqs_broker = DelayMessageConsumerBroker::new(
+        let mut sqs_broker = DelayMessageConsumerBroker::new(
             |actor| {
                 DelayMessageConsumer::new(sqs_client.clone(), queue_url.clone(), metrics.clone(), actor, state_manager.clone(), processor.clone(), throttler.clone())
             },
@@ -1428,56 +1422,143 @@ mod test {
 
         throttler.register_consumer_throttler(consumer_throttler);
 
+        {
+            let mut workers = sqs_broker.workers.iter();
+            let first = workers.next().unwrap();
+            first.consume();
 
-        let mut sm: xorshift::SplitMix64 = xorshift::SeedableRng::from_seed(1);
-        let mut rng: xorshift::Xoroshiro128 = xorshift::Rand::rand(&mut sm);
+            time!({
+                for worker in workers {
+                    worker.consume();
+                }
+                loop {
+                    let count = sqs_client.deletes.load(Ordering::Relaxed);
 
-        let mut workers = sqs_broker.workers.iter();
-        let first = workers.next().unwrap();
-        first.consume();
+                    if count < 1_000 {
 
-    //        thread::sleep(Duration::from_secs(2));
-
-        time!({
-        for worker in workers {
-            worker.consume();
+                    } else {
+                        let count = sqs_client.deletes.store(0, Ordering::Relaxed);
+                        break
+                    }
+                }
+            }, "completed");
         }
-
-        loop {
-            let count = sqs_client.deletes.load(Ordering::Relaxed);
-
-            if count < 100_000 {
-
-            } else {
-                let count = sqs_client.deletes.store(0, Ordering::Relaxed);
-                break
-            }
-        }
-        }, "completed");
-
-        time!({
-        loop {
-            let count = sqs_client.deletes.load(Ordering::Relaxed);
-
-            if count < 100_000 {
-
-            } else {
-                break
-            }
-        }
-    }, "completed");
-        println!("consumers started");
-
-        //        thread::sleep(Duration::from_secs(10));
-        //        println!("Writing stats to disk");
-//        flame::dump_html(&mut File::create("flame-graph.html").unwrap()).unwrap();
-        //        thread::sleep(Duration::from_secs(120));
-
+        // Remove all consumer threads
+        sqs_broker.shut_down();
 
         thread::sleep(Duration::from_secs(5));
-        loop {
-            thread::park()
+
+        assert!(sns_client.publishes.load(Ordering::Relaxed) == 1000);
+    }
+
+    #[test]
+    fn test_throttler() {
+        util::set_timer();
+        let timer = util::get_timer();
+
+        let log_path = "test_everything.log";
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .expect(&format!("Failed to create log file {}", log_path));
+
+        // create logger
+        let logger = slog::Logger::root(
+            Mutex::new(slog_json::Json::default(file)).map(slog::Fuse),
+            o!("version" => env!("CARGO_PKG_VERSION"),
+           "place" =>
+              FnValue(move |info| {
+                  format!("{}:{} {}",
+                          info.file(),
+                          info.line(),
+                          info.module())
+              }))
+        );
+
+        // slog_stdlog uses the logger from slog_scope, so set a logger there
+        let _guard = slog_scope::set_global_logger(logger);
+        
+        let mut throttler = Throttler::new();
+
+        let old_limit = throttler.get_inflight_limit();
+
+        for _ in 0..64 {
+            throttler.message_start("receipt".to_owned(), Instant::now());
+            throttler.message_stop("receipt".to_owned(), Instant::now(), false);
         }
+
+        assert_eq!(old_limit, throttler.get_inflight_limit());
+
+        // Given an increase in processing times we expect our inflight message
+        // limit to decrease
+        for _ in 0..64 {
+            throttler.message_start("receipt".to_owned(), Instant::now());
+            thread::sleep(Duration::from_millis(10));
+            throttler.message_stop("receipt".to_owned(), Instant::now(), true);
+        }
+
+        let old_limit = throttler.get_inflight_limit();
+
+        for _ in 0..64 {
+            throttler.message_start("receipt".to_owned(), Instant::now());
+            thread::sleep(Duration::from_millis(50));
+            throttler.message_stop("receipt".to_owned(), Instant::now(), true);
+        }
+
+        let new_limit = throttler.get_inflight_limit();
+
+        assert!(old_limit > new_limit);
+
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    #[test]
+    fn test_deleter() {
+        util::set_timer();
+        let timer = util::get_timer();
+
+        let log_path = "test_everything.log";
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .expect(&format!("Failed to create log file {}", log_path));
+
+        // create logger
+        let logger = slog::Logger::root(
+            Mutex::new(slog_json::Json::default(file)).map(slog::Fuse),
+            o!("version" => env!("CARGO_PKG_VERSION"),
+           "place" =>
+              FnValue(move |info| {
+                  format!("{}:{} {}",
+                          info.file(),
+                          info.line(),
+                          info.module())
+              }))
+        );
+
+        let provider = util::get_profile_provider();
+        let queue_name = "local-dev-cobrien-TEST_QUEUE";
+        let queue_url = "some queue url".to_owned();
+
+        let metrics = Arc::new(Client::new(Options::default()).expect("Failure to create metrics"));
+
+        let sqs_client = Arc::new(new_sqs_client(&provider));
+
+
+        let throttler = Throttler::new();
+        let throttler = ThrottlerActor::new(throttler);
+
+        let mut deleter = MessageDeleter::new(sqs_client.clone(), queue_url.clone(), throttler.clone());
+
+        deleter.delete_messages(vec![("receipt1".to_owned(), Instant::now())]);
+
+        thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(sqs_client.deletes.load(Ordering::Relaxed), 1);
     }
 
     fn new_sqs_client<P>(sqs_provider: &P) -> MockSqs
@@ -1493,7 +1574,7 @@ mod test {
         where P: ProvideAwsCredentials + Clone + Send + 'static
     {
         MockSns {
-            publishes: Arc::new(Mutex::new(0))
+            publishes: Arc::new(AtomicUsize::new(0))
         }
     }
 }

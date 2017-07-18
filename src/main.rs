@@ -202,7 +202,7 @@ fn main() {
     let state_manager = MessageStateManager::new(buffer, deleter.clone());
     let state_manager = MessageStateManagerActor::new(state_manager);
 
-    let processor = DelayMessageProcessorBroker::new(
+    let processor = MessageHandlerBroker::new(
         |_| {
             let publisher = MessagePublisher::new(sns_client.clone(), state_manager.clone());
             DelayMessageProcessor::new(publisher, TopicCreator::new(sns_client.clone()))
