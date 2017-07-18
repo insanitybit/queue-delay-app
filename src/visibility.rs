@@ -1479,7 +1479,7 @@ mod test {
 
         // slog_stdlog uses the logger from slog_scope, so set a logger there
         let _guard = slog_scope::set_global_logger(logger);
-        
+
         let mut throttler = Throttler::new();
 
         let old_limit = throttler.get_inflight_limit();

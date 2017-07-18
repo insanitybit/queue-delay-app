@@ -393,7 +393,7 @@ impl StreamingMedian {
     }
 
     pub fn insert_and_calculate(&mut self, value: u32) -> u32 {
-        let mut scratch_space: [u32; 64] = unsafe {uninitialized()};
+        let mut scratch_space: [u32; 63] = unsafe {uninitialized()};
 
         let removed = match self.data.pop_front() {
             Some(t) => t,
@@ -401,11 +401,22 @@ impl StreamingMedian {
         };
         self.data.push_back(value);
 
-        let remove_index = self.sorted.binary_search(&removed).unwrap();
+        if removed == value {
+            return unsafe {*self.sorted.get_unchecked(31)};
+        }
 
-        let insert_index = match self.sorted.binary_search(&value) {
-            Ok(t) => t,
-            Err(t) => t,
+        let remove_index = binary_search(&self.sorted, &removed);
+
+        // If removed is larger than value than the remove_index must be
+        // after the insert_index, allowing us to cut our search down
+        let insert_index = {
+            let sorted_slice = if removed > value {
+                &self.sorted[..remove_index]
+            } else {
+                &self.sorted[remove_index..]
+            };
+
+            binary_search(&self.sorted, &value)
         };
 
         // shift the data between remove_index and insert_index so that the
@@ -445,6 +456,34 @@ impl StreamingMedian {
     }
 }
 
+use std::cmp::Ordering;
+
+fn binary_search<T>(t: &[T], x: &T) -> usize where T: Ord {
+    binary_search_by(t, |p| p.cmp(x))
+}
+
+fn binary_search_by<T, F>(t: &[T], mut f: F) -> usize
+    where F: FnMut(&T) -> Ordering
+{
+    let mut base = 0usize;
+    let mut s = t;
+
+    loop {
+        let (head, tail) = s.split_at(s.len() >> 1);
+        if tail.is_empty() {
+            return base
+        }
+        match f(&tail[0]) {
+            Ordering::Less => {
+                base += head.len() + 1;
+                s = &tail[1..];
+            }
+            Ordering::Greater => s = head,
+            Ordering::Equal => return base + head.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -479,9 +518,13 @@ mod test {
     }
 }
 
+//fn inallible_binary_search(s: &)
+
 mod bench {
     use super::*;
     use test::Bencher;
+    use xorshift::{Xoroshiro128, Rng, SeedableRng};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[bench]
     fn bench_insert(b: &mut Bencher) {
@@ -517,6 +560,31 @@ mod bench {
 
         b.iter(|| {
             median_tracker.insert_and_calculate(100);
+        });
+    }
+
+    #[bench]
+    fn bench_insert_calculate_rand(b: &mut Bencher) {
+        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
+
+        let mut median_tracker = StreamingMedian::new();
+
+        b.iter(|| {
+            median_tracker.insert(rng.gen());
+            median_tracker.current();
+        });
+    }
+
+    #[bench]
+    fn bench_insert_and_calculate_rand(b: &mut Bencher) {
+        let t = millis(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let mut rng = Xoroshiro128::from_seed(&[t, 71, 1223]);
+
+        let mut median_tracker = StreamingMedian::new();
+
+        b.iter(|| {
+            median_tracker.insert_and_calculate(rng.gen());
         });
     }
 }
