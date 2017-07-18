@@ -410,13 +410,13 @@ impl StreamingMedian {
         // If removed is larger than value than the remove_index must be
         // after the insert_index, allowing us to cut our search down
         let insert_index = {
-            let sorted_slice = if removed > value {
-                &self.sorted[..remove_index]
+            if removed > value {
+                let sorted_slice = unsafe{self.sorted.get_unchecked(..remove_index)};
+                binary_search(sorted_slice, &value)
             } else {
-                &self.sorted[remove_index..]
-            };
-
-            binary_search(&self.sorted, &value)
+                let sorted_slice = unsafe{self.sorted.get_unchecked(remove_index..)};
+                remove_index + binary_search(sorted_slice, &value)
+            }
         };
 
         // shift the data between remove_index and insert_index so that the
