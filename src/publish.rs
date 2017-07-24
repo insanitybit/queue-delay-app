@@ -109,7 +109,6 @@ impl<SN> TopicCreator<SN>
                     Ok(arn) => {
                         match arn.topic_arn {
                             Some(arn) => {
-                                //                                info!("Created topic: {}", arn);
                                 vac.insert(arn.clone());
                                 Ok(Topic::Created(arn))
                             }
