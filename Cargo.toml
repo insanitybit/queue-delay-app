@@ -5,52 +5,23 @@ version = "0.1.0"
 authors = ["insanitybit <insanitybit@gmail.com>"]
 
 [dependencies]
-rand = "*"
-arraydeque = {version = "*", features=["use_union"]}
-coco = "*"
-double = "0.1.3"
-dogstatsd = "0.3.0"
+base64 = "~0.6.*"
+hyper = "0.10.*"
+lru_time_cache = "0.6.*"
+rusoto_credential = {version = "0.7.0"}
 rusoto_core = {version = "0.25.0"}
-chrono = "*"
 rusoto_sqs = {version = "0.25.0"}
 rusoto_sns = {version = "0.25.0"}
-rusoto_credential = {version = "0.7.0"}
-hyper = "0.10.*"
-futures = "*"
-tokio-core = "*"
-spmc = "*"
-tokio-timer = "0.1"
-futures-cpupool = "*"
-threadpool = "1.0"
-two-lock-queue = "*"
-serde_json = "1.0"
-serde_derive = "1.0"
-serde = "1.0"
-lru_time_cache = "*"
-backoff = "0.1.2"
-slog-scope = "*"
-slog-stdlog = "*"
-slog-term = "*"
-slog-json = "*"
-slog-stream = "*"
-lazy_static = "*"
-base64 = "~0.6.0"
-stopwatch = "*"
-parking_lot = {version = "0.4", features = ["nightly"]}
-
-env_logger = "*"
-flame = { version = "^0.1.9", optional = true }
-flamer = { version = "^0.1.4", optional = true }
-fibers = "*"
-arrayvec = "0.3.23"
-xorshift = "*"
-
+serde_json = "1.*"
+serde_derive = "1.*"
+serde = "1.*"
+sqs-service-helper = "0.1.*"
+two-lock-queue = "0.1.*"
 uuid = { version = "0.5", features = ["v4"] }
-itertools = "*"
 
-[dependencies.log]
-version = "*"
-#features = ["max_level_error", "release_max_level_error"]
+slog-term = "2.0.2"
+slog-json = "2.0.*"
+tokio-core = "0.1.*"
 
 [dependencies.slog]
 version = "2"
@@ -58,4 +29,3 @@ version = "2"
 
 [features]
 default = []
-flame_it = ["flame", "flamer"]

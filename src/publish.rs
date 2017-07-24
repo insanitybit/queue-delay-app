@@ -1,11 +1,11 @@
-use visibility::*;
 use two_lock_queue::{unbounded, Sender, Receiver, RecvTimeoutError, channel};
 use uuid;
 
 use std::time::{Duration};
 use rusoto_sns::{Sns, PublishInput};
 use delay::DelayMessage;
-use slog_scope;
+
+use slog::Logger;
 use std::sync::Arc;
 use std::iter::Iterator;
 use std::thread;
@@ -15,30 +15,19 @@ pub struct MessagePublisher<SN>
     where SN: Sns + Send + Sync + 'static,
 {
     sns_client: Arc<SN>,
-    vis_manager: MessageStateManagerActor,
+    logger: Logger
 }
 
 impl<SN> MessagePublisher<SN>
     where SN: Sns + Send + Sync + 'static,
 {
     #[cfg_attr(feature="flame_it", flame)]
-    pub fn new(sns_client: Arc<SN>, vis_manager: MessageStateManagerActor) -> MessagePublisher<SN> {
+    pub fn new(sns_client: Arc<SN>, logger: Logger)
+               -> MessagePublisher<SN>
+    {
         MessagePublisher {
             sns_client,
-            vis_manager
-        }
-    }
-
-    #[cfg_attr(feature="flame_it", flame)]
-    pub fn publish_and_delete(&self, msg: DelayMessage, topic_arn: String, receipt: String) {
-        match self.publish(msg.message, topic_arn) {
-            Ok(_)   => {
-                self.vis_manager.deregister(receipt.clone(), true);
-            },
-            Err(e)  => {
-                warn!(slog_scope::logger(), "Failed to publish message with: {}", e);
-                self.vis_manager.deregister(receipt, false);
-            }
+            logger
         }
     }
 
@@ -69,14 +58,15 @@ impl<SN> MessagePublisher<SN>
     }
 
     #[cfg_attr(feature="flame_it", flame)]
-    pub fn route_msg(&self, msg: MessagePublisherMessage) {
+    pub fn route_msg(&mut self, msg: MessagePublisherMessage) {
         match msg {
             MessagePublisherMessage::PublishAndDelete {message, topic_arn, receipt}  =>
-                self.publish_and_delete(message, topic_arn, receipt)
-        }
+                self.publish(message.message, topic_arn)
+        };
     }
 }
 
+#[derive(Debug)]
 pub enum MessagePublisherMessage {
     PublishAndDelete {
         message: DelayMessage,
@@ -88,7 +78,6 @@ pub enum MessagePublisherMessage {
 #[derive(Clone)]
 pub struct MessagePublisherActor {
     sender: Sender<MessagePublisherMessage>,
-    receiver: Receiver<MessagePublisherMessage>,
     id: String,
 }
 
@@ -97,6 +86,7 @@ impl MessagePublisherActor {
     pub fn new<SN>(actor: MessagePublisher<SN>) -> MessagePublisherActor
         where SN: Sns + Send + Sync + 'static,
     {
+        let mut actor = actor;
         let (sender, receiver) = unbounded();
         let id = uuid::Uuid::new_v4().to_string();
         let recvr = receiver.clone();
@@ -120,9 +110,8 @@ impl MessagePublisherActor {
             });
 
         MessagePublisherActor {
-            sender: sender,
-            receiver: receiver,
-            id: id,
+            sender,
+            id,
         }
     }
 
@@ -139,8 +128,7 @@ impl MessagePublisherActor {
 
         let actor = MessagePublisherActor {
             sender: sender.clone(),
-            receiver: receiver.clone(),
-            id: id,
+            id,
         };
 
         let mut _actor = new(actor.clone());
@@ -217,3 +205,73 @@ impl MessagePublisherBroker
     }
 }
 
+
+use lru_time_cache::LruCache;
+
+#[derive(Debug)]
+pub enum Topic {
+    Cached(String),
+    Created(String)
+}
+
+impl Topic {
+    pub fn get(self) -> String {
+        match self {
+            Topic::Cached(t) | Topic::Created(t) => t,
+        }
+    }
+}
+
+
+use lru_time_cache::Entry;
+use rusoto_sns::CreateTopicInput;
+
+pub struct TopicCreator<SN>
+    where SN: Sns + Send + Sync + 'static,
+{
+    sns_client: Arc<SN>,
+    topic_cache: LruCache<String, String>,
+}
+
+impl<SN> TopicCreator<SN>
+    where SN: Sns + Send + Sync + 'static,
+{
+    pub fn new(sns_client: Arc<SN>) -> TopicCreator<SN> {
+        TopicCreator {
+            sns_client,
+            topic_cache: LruCache::with_expiry_duration_and_capacity(Duration::from_secs(60 * 60), 500),
+        }
+    }
+
+    pub fn get_or_create(&mut self, topic_name: &str) -> Result<Topic, String> {
+        let entry = self.topic_cache.entry(topic_name.to_owned());
+
+        match entry {
+            Entry::Occupied(oc) => {
+                Ok(Topic::Cached(oc.into_mut().to_owned()))
+            }
+            Entry::Vacant(vac) => {
+                let create_topic_input = CreateTopicInput {
+                    name: topic_name.to_owned()
+                };
+                let arn_res = self.sns_client.create_topic(&create_topic_input);
+
+                match arn_res {
+                    Ok(arn) => {
+                        match arn.topic_arn {
+                            Some(arn) => {
+                                //                                info!("Created topic: {}", arn);
+                                vac.insert(arn.clone());
+                                Ok(Topic::Created(arn))
+                            }
+                            None => Err("returned arn was None".to_owned())
+                        }
+                    }
+                    Err(e) => {
+                        Err(format!("{}", e))
+                    }
+                }
+            }
+        }
+    }
+}
