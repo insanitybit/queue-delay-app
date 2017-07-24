@@ -18,16 +18,14 @@ extern crate serde_json;
 extern crate two_lock_queue;
 extern crate uuid;
 
-use rusoto_sqs::{Sqs, SqsClient, CreateQueueRequest};
 use rusoto_credential::{ProvideAwsCredentials, ChainProvider, ProfileProvider};
 use rusoto_core::{default_tls_client, Region};
 use rusoto_sns::SnsClient;
 use std::fs::OpenOptions;
 use slog::{Drain, FnValue};
-use slog::Logger;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use sqs_service_helper::service::{SqsServiceBuilder, Service};
+use sqs_service_helper::service::SqsServiceBuilder;
 use std::env;
 use std::time::Duration;
 
@@ -61,19 +59,21 @@ fn main() {
     let provider = get_profile_provider();
     let sns_client = Arc::new(new_sns_client(&provider));
 
-    let publisher = MessagePublisher::new(
-        sns_client.clone(),
-        logger.clone());
-
-    let service = SqsServiceBuilder::default()
-        .with_message_handler(move |_| {
+    let l = logger.clone();
+    let mut service = SqsServiceBuilder::default()
+        .with_message_handler(|_| {
             let topic_creator = TopicCreator::new(
-                sns_client
+                sns_client.clone()
             );
+
+            let publisher = MessagePublisher::new(
+                sns_client.clone(),
+                l.clone());
+
             DelayMessageProcessor::new(
                 publisher,
                 topic_creator,
-                logger
+                l.clone()
             )
         })
         .with_msg_handler_count(4)
@@ -83,12 +83,13 @@ fn main() {
         .with_visibility_buffer_flush_period(Duration::from_millis(500))
         .with_deleter_count(4)
         .with_deleter_buffer_flush_period(Duration::from_millis(500))
-        .with_with_url("queue_url".to_owned())
+        .with_queue_url("queue_url".to_owned())
         .with_short_circuit(true)
         .with_throttle_consumers(true)
         .with_logger(logger)
         .build();
 
+    service.start();
     loop {
         thread::park();
     }

@@ -15,7 +15,7 @@ rusoto_sns = {version = "0.25.0"}
 serde_json = "1.*"
 serde_derive = "1.*"
 serde = "1.*"
-sqs-service-helper = "0.1.*"
+sqs-service-helper = {path = "../sqs-service-helper/"}
 two-lock-queue = "0.1.*"
 uuid = { version = "0.5", features = ["v4"] }
 
